@@ -5,6 +5,7 @@ import { readFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import {
+  setDefaultWorkdir,
   handleChat,
   handleStream,
   handleTodos,
@@ -17,9 +18,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface WebServerOptions {
   port: number;
+  workdir?: string;
 }
 
 export async function startWebServer(options: WebServerOptions): Promise<void> {
+  if (options.workdir) {
+    setDefaultWorkdir(options.workdir);
+  }
   const app = express();
   const httpServer = createServer(app);
 
@@ -117,5 +122,6 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
   console.log(`\n  Web UI:  http://localhost:${options.port}`);
   console.log(`  API:     http://localhost:${options.port}/api`);
   console.log(`  WS:      ws://localhost:${options.port}/ws`);
-  console.log(`  Health:  http://localhost:${options.port}/health\n`);
+  console.log(`  Health:  http://localhost:${options.port}/health`);
+  console.log(`  Workdir: ${options.workdir ?? process.cwd()}\n`);
 }

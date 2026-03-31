@@ -3,6 +3,12 @@ import type { WebSocket } from 'ws';
 import { AgentOrchestrator } from '../agent/index.js';
 import type { AgentOptions, AgentSession, StreamEvent } from '../types.js';
 
+let serverWorkdir = process.cwd();
+
+export function setDefaultWorkdir(workdir: string): void {
+  serverWorkdir = workdir;
+}
+
 interface ActiveSession {
   orchestrator: AgentOrchestrator;
   session: AgentSession | null;
@@ -71,7 +77,7 @@ export async function handleChat(req: Request, res: Response): Promise<void> {
     maxTurns: userOptions?.maxTurns || 50,
     budget: userOptions?.budget || 5.0,
     permissionMode: userOptions?.permissionMode || 'acceptEdits',
-    workdir: userOptions?.workdir || process.cwd(),
+    workdir: userOptions?.workdir || serverWorkdir,
     verbose: userOptions?.verbose || false,
   };
 
@@ -196,7 +202,7 @@ export function handleResume(req: Request, res: Response): void {
     maxTurns: userOptions?.maxTurns || 50,
     budget: userOptions?.budget || 5.0,
     permissionMode: userOptions?.permissionMode || 'acceptEdits',
-    workdir: userOptions?.workdir || process.cwd(),
+    workdir: userOptions?.workdir || serverWorkdir,
     verbose: userOptions?.verbose || false,
   };
 

@@ -367,7 +367,7 @@ program
     if (opts['web']) {
       const { startWebServer } = await import('./server/index.js');
       console.log(chalk.cyan(`\nStarting web server on port ${port}...`));
-      await startWebServer({ port });
+      await startWebServer({ port, workdir });
 
       // Try to open browser
       try {
