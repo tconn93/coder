@@ -5,8 +5,13 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { createInterface } from 'readline';
+import { join, relative } from 'path';
+import { generateText } from 'ai';
 import { AgentOrchestrator } from './agent/index.js';
 import { listProviders, getDefaultModel } from './providers/index.js';
+import { getProvider } from './providers/index.js';
+import { AgentLoader } from './agent/agentLoader.js';
+import { BUILTIN_AGENTS } from './agent/tools.js';
 import { App } from './ui/App.js';
 import type {
   AgentOptions,
@@ -14,6 +19,7 @@ import type {
   TokenUsage,
   TodoItem,
   PermissionMode,
+  CustomAgentDef,
 } from './types.js';
 
 const VERSION = '1.0.0';
@@ -164,7 +170,139 @@ async function runAgentCLI(
 }
 
 function runREPL(options: AgentOptions): void {
+  // Clear terminal before Ink takes over so the UI fills from the top
+  process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
   render(React.createElement(App, { options }));
+}
+
+// ---------------------------------------------------------------------------
+// agents command helpers
+// ---------------------------------------------------------------------------
+
+async function listAgents(workdir: string): Promise<void> {
+  console.log(chalk.bold('\nBuilt-in agents:\n'));
+  for (const agent of BUILTIN_AGENTS) {
+    console.log(`  ${chalk.cyan(agent.name.padEnd(20))} ${agent.description}`);
+    console.log(`  ${''.padEnd(20)} ${chalk.gray(`model: ${agent.model}`)}`);
+  }
+
+  const loader = new AgentLoader(join(workdir, 'agents'));
+  const custom = await loader.loadAll();
+
+  const dir = join(workdir, 'agents');
+  console.log(chalk.bold(`\nCustom agents`) + chalk.gray(` (${dir}):\n`));
+  if (custom.length === 0) {
+    console.log(chalk.gray(`  (none — run 'coder agents create' to add one)\n`));
+  } else {
+    for (const agent of custom) {
+      console.log(`  ${chalk.cyan(agent.name.padEnd(20))} ${agent.description}`);
+      console.log(`  ${''.padEnd(20)} ${chalk.gray(`model: ${agent.model}  tools: ${agent.tools.join(', ')}`)}`);
+    }
+    console.log('');
+  }
+}
+
+async function createAgent(workdir: string, provider: string, model: string): Promise<void> {
+  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
+    console.error(chalk.red('\nError: ANTHROPIC_API_KEY environment variable is not set.\n'));
+    process.exit(1);
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q: string) => new Promise<string>((r) => rl.question(q, r));
+
+  console.log(chalk.cyan('\nCreate a custom subagent\n'));
+  const description = (
+    await ask(chalk.bold('What should this agent do? ') + chalk.gray('(describe its purpose)\n> '))
+  ).trim();
+  rl.close();
+
+  if (!description) {
+    console.log(chalk.gray('Cancelled.\n'));
+    return;
+  }
+
+  const spinner = ora('Generating agent definition…').start();
+
+  let agentDef: CustomAgentDef;
+  try {
+    const { text } = await generateText({
+      model: getProvider(provider, model),
+      messages: [
+        {
+          role: 'user',
+          content: `Create a custom AI subagent definition for this purpose: "${description}"
+
+Respond with ONLY a JSON object (no markdown fences, no explanation):
+{
+  "name": "kebab-case-slug",
+  "description": "one concise sentence",
+  "model": "claude-sonnet-4-6",
+  "tools": ["read_file"],
+  "systemPrompt": "detailed system prompt paragraphs..."
+}
+
+Rules:
+- name: lowercase kebab-case, 2-4 words
+- model: claude-opus-4-6 (complex reasoning), claude-sonnet-4-6 (general), claude-haiku-4-5 (simple/fast)
+- tools: choose only what's needed from [read_file, write_file, edit_file, bash, glob, grep]
+- systemPrompt: 2-4 paragraphs covering expertise, approach, and key behaviors`,
+        },
+      ],
+    });
+
+    spinner.stop();
+
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON object found in response');
+    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+
+    agentDef = {
+      name: String(parsed.name || 'custom-agent'),
+      description: String(parsed.description || description),
+      model: String(parsed.model || 'claude-sonnet-4-6'),
+      tools: Array.isArray(parsed.tools)
+        ? (parsed.tools as unknown[]).map(String)
+        : ['read_file', 'grep', 'glob'],
+      systemPrompt: String(parsed.systemPrompt || ''),
+    };
+  } catch (err) {
+    spinner.stop();
+    console.error(chalk.red(`\nFailed to generate agent: ${(err as Error).message}\n`));
+    return;
+  }
+
+  // Display the generated definition
+  console.log(chalk.bold('\nGenerated agent:\n'));
+  console.log(`  ${chalk.cyan('Name:')}         ${agentDef.name}`);
+  console.log(`  ${chalk.cyan('Description:')}  ${agentDef.description}`);
+  console.log(`  ${chalk.cyan('Model:')}        ${agentDef.model}`);
+  console.log(`  ${chalk.cyan('Tools:')}        ${agentDef.tools.join(', ')}`);
+  console.log(`\n${chalk.cyan('System prompt:')}`);
+  console.log(
+    chalk.gray(
+      agentDef.systemPrompt
+        .split('\n')
+        .map((l) => `  ${l}`)
+        .join('\n'),
+    ),
+  );
+
+  const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+  const confirm = await new Promise<string>((r) =>
+    rl2.question(chalk.bold('\nSave this agent? ') + chalk.gray('[Y/n] '), r),
+  );
+  rl2.close();
+
+  if (confirm.trim().toLowerCase() === 'n') {
+    console.log(chalk.gray('Cancelled.\n'));
+    return;
+  }
+
+  const loader = new AgentLoader(join(workdir, 'agents'));
+  const filepath = await loader.save(agentDef);
+  console.log(chalk.green(`\nSaved to ${relative(workdir, filepath)}\n`));
+  console.log(chalk.gray(`The agent '${agentDef.name}' is now available via spawn_subagent.\n`));
 }
 
 // Main CLI program
@@ -187,6 +325,7 @@ program
     'acceptEdits',
   )
   .option('--workdir <path>', 'Working directory', process.cwd())
+  .option('--working-dir <path>', 'Working directory (alias for --workdir)')
   .option('--resume <id>', 'Resume a previous session')
   .option('--list-providers', 'List available providers and models')
   .option('-v, --verbose', 'Verbose output (show all tool results)')
@@ -202,7 +341,7 @@ program
     const maxTurns = parseInt(String(opts['maxTurns'] || '50'));
     const budget = parseFloat(String(opts['budget'] || '5.00'));
     const permissionMode = String(opts['permissionMode'] || 'acceptEdits') as PermissionMode;
-    const workdir = String(opts['workdir'] || process.cwd());
+    const workdir = String(opts['workingDir'] || opts['workdir'] || process.cwd());
     const verbose = Boolean(opts['verbose']);
     const port = parseInt(String(opts['port'] || '3000'));
 
@@ -280,6 +419,31 @@ program
       await runAgentCLI(prompt, agentOptions);
     } else {
       await runREPL(agentOptions);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// agents subcommand
+// ---------------------------------------------------------------------------
+program
+  .command('agents [action]')
+  .description("Manage subagents: 'list' (default) or 'create'")
+  .option('--workdir <path>', 'Working directory', process.cwd())
+  .option('--working-dir <path>', 'Working directory (alias for --workdir)')
+  .option('--provider <name>', 'LLM provider for agent creation', process.env.DEFAULT_PROVIDER ?? 'anthropic')
+  .option('--model <name>', 'Model for agent creation')
+  .action(async (action: string | undefined, opts: Record<string, string>) => {
+    const workdir = String(opts['workingDir'] || opts['workdir'] || process.cwd());
+    const provider = String(opts['provider'] || 'anthropic');
+    const model = String(opts['model'] || getDefaultModel(provider));
+
+    if (!action || action === 'list') {
+      await listAgents(workdir);
+    } else if (action === 'create') {
+      await createAgent(workdir, provider, model);
+    } else {
+      console.error(chalk.red(`\nUnknown action '${action}'. Use 'list' or 'create'.\n`));
+      process.exit(1);
     }
   });
 

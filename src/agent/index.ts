@@ -8,6 +8,8 @@ import type {
 } from '../types.js';
 import { runAgentLoop } from './loop.js';
 import { SkillsLoader } from './skills.js';
+import { AgentLoader } from './agentLoader.js';
+import { loadProjectConfig } from '../config.js';
 
 export class AgentOrchestrator {
   private sessions: Map<string, AgentSession> = new Map();
@@ -15,9 +17,14 @@ export class AgentOrchestrator {
   private sessionMessages: Map<string, unknown[]> = new Map();
   private skillsLoader: SkillsLoader;
 
+  private agentLoader: AgentLoader;
+
   constructor(workdir?: string) {
     this.skillsLoader = new SkillsLoader(
       workdir ? join(workdir, 'skills') : undefined,
+    );
+    this.agentLoader = new AgentLoader(
+      workdir ? join(workdir, 'agents') : join(process.cwd(), 'agents'),
     );
   }
 
@@ -31,6 +38,8 @@ export class AgentOrchestrator {
     await this.skillsLoader.loadAll();
     const skillsContext = this.skillsLoader.getSystemPromptAddition();
     const systemPrompt = await this.buildSystemPrompt(options, skillsContext);
+    const customAgents = await this.agentLoader.loadAll();
+    const projectConfig = await loadProjectConfig(options.workdir);
 
     const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
     const tokenUsage: TokenUsage = {
@@ -60,6 +69,8 @@ export class AgentOrchestrator {
       workdir: options.workdir,
       verbose: options.verbose,
       sessionId,
+      customAgents,
+      debugPrompt: projectConfig.debugPrompt,
     })) {
       if (event.type === 'token_usage') {
         session.tokenUsage = event.data as TokenUsage;
@@ -91,6 +102,8 @@ export class AgentOrchestrator {
     await this.skillsLoader.loadAll();
     const skillsContext = this.skillsLoader.getSystemPromptAddition();
     const systemPrompt = await this.buildSystemPrompt(options, skillsContext);
+    const customAgents = await this.agentLoader.loadAll();
+    const projectConfig = await loadProjectConfig(options.workdir);
 
     for await (const event of runAgentLoop({
       prompt: newPrompt,
@@ -103,6 +116,8 @@ export class AgentOrchestrator {
       verbose: options.verbose,
       previousMessages,
       sessionId,
+      customAgents,
+      debugPrompt: projectConfig.debugPrompt,
     })) {
       if (event.type === 'done') {
         const done = event.data as { messages?: unknown[] };

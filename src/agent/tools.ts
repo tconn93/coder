@@ -11,6 +11,7 @@ import { promisify } from 'util';
 import fg from 'fast-glob';
 import { TodoTracker } from './todos.js';
 import { getProvider } from '../providers/index.js';
+import type { CustomAgentDef } from '../types.js';
 
 const execAsync = promisify(exec);
 
@@ -19,6 +20,7 @@ const execAsync = promisify(exec);
 // ---------------------------------------------------------------------------
 
 interface SubagentDef {
+  description: string;
   systemPrompt: string;
   tools: string[];
   model: string;
@@ -26,6 +28,7 @@ interface SubagentDef {
 
 const SUBAGENT_DEFS: Record<string, SubagentDef> = {
   'code-reviewer': {
+    description: 'Security audits, code quality, performance analysis',
     systemPrompt: `You are an expert code reviewer with deep knowledge of security vulnerabilities, performance optimization, and software engineering best practices.
 
 When reviewing code:
@@ -40,6 +43,7 @@ Be thorough, specific, and constructive. Always cite specific line numbers and f
     model: 'claude-sonnet-4-6',
   },
   'test-runner': {
+    description: 'Execute tests, analyze failures, improve coverage',
     systemPrompt: `You are an expert test engineer who specializes in running tests and analyzing results.
 
 When working with tests:
@@ -52,6 +56,7 @@ When working with tests:
     model: 'claude-sonnet-4-6',
   },
   'file-explorer': {
+    description: 'Map codebase structure, find files, understand architecture',
     systemPrompt: `You are an expert at exploring and understanding codebases.
 
 When exploring:
@@ -64,6 +69,7 @@ When exploring:
     model: 'claude-haiku-4-5',
   },
   'security-scanner': {
+    description: 'Find vulnerabilities, secrets, injection risks',
     systemPrompt: `You are a security expert specializing in identifying vulnerabilities in code.
 
 When scanning:
@@ -78,6 +84,7 @@ Report findings with severity levels (Critical/High/Medium/Low) and remediation 
     model: 'claude-opus-4-6',
   },
   'doc-writer': {
+    description: 'Write README, API docs, inline documentation',
     systemPrompt: `You are a technical writer who creates clear, comprehensive documentation.
 
 When writing docs:
@@ -90,6 +97,31 @@ When writing docs:
     model: 'claude-sonnet-4-6',
   },
 };
+
+/** Exported for use in CLI listing and REPL /agents command. */
+export const BUILTIN_AGENTS = Object.entries(SUBAGENT_DEFS).map(([name, def]) => ({
+  name,
+  description: def.description,
+  model: def.model,
+}));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Decode HTML entities in a string before writing to disk. */
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/&amp;/g,  '&')
+    .replace(/&lt;/g,   '<')
+    .replace(/&gt;/g,   '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g,  "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g,       (_, code: string) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+}
 
 // ---------------------------------------------------------------------------
 // Base tools (no spawn_subagent — safe to use inside subagent contexts)
@@ -129,7 +161,8 @@ export function createBaseTools(workdir: string, todoTracker: TodoTracker) {
         content: z.string().describe('Content to write'),
       }),
       execute: async (input) => {
-        const { path, content } = input;
+        const { path } = input;
+        const content = decodeHtmlEntities(input.content);
         const filePath = resolve(workdir, path);
         try {
           await fs.mkdir(dirname(filePath), { recursive: true });
@@ -154,7 +187,9 @@ export function createBaseTools(workdir: string, todoTracker: TodoTracker) {
           .describe('Replace all occurrences (default: replace first only)'),
       }),
       execute: async (input) => {
-        const { path, old_string, new_string, replace_all } = input;
+        const { path, replace_all } = input;
+        const old_string = decodeHtmlEntities(input.old_string);
+        const new_string = decodeHtmlEntities(input.new_string);
         const filePath = resolve(workdir, path);
         try {
           const content = await fs.readFile(filePath, 'utf-8');
@@ -298,28 +333,28 @@ export function createTools(
   workdir: string,
   todoTracker: TodoTracker,
   provider: string,
+  customAgents: CustomAgentDef[] = [],
 ) {
   const base = createBaseTools(workdir, todoTracker);
 
-  const spawn_subagent = tool({
-    description: `Spawn a specialized subagent for a focused subtask. The subagent runs in isolation and returns its final answer.
+  // Merge built-in and custom agent definitions
+  const allAgents: Record<string, SubagentDef> = { ...SUBAGENT_DEFS };
+  for (const ca of customAgents) {
+    allAgents[ca.name] = {
+      description: ca.description,
+      systemPrompt: ca.systemPrompt,
+      tools: ca.tools,
+      model: ca.model,
+    };
+  }
+  const agentList = Object.entries(allAgents)
+    .map(([n, d]) => `- ${n}: ${d.description}`)
+    .join('\n');
 
-Available subagents:
-- code-reviewer: Security audits, code quality, performance analysis
-- test-runner: Execute tests, analyze failures, improve coverage
-- file-explorer: Map codebase structure, find files, understand architecture
-- security-scanner: Find vulnerabilities, secrets, injection risks
-- doc-writer: Write README, API docs, inline documentation`,
+  const spawn_subagent = tool({
+    description: `Spawn a specialized subagent for a focused subtask. The subagent runs in isolation and returns its final answer.\n\nAvailable subagents:\n${agentList}`,
     inputSchema: z.object({
-      name: z
-        .enum([
-          'code-reviewer',
-          'test-runner',
-          'file-explorer',
-          'security-scanner',
-          'doc-writer',
-        ])
-        .describe('Subagent to spawn'),
+      name: z.string().describe(`Subagent name. Available: ${Object.keys(allAgents).join(', ')}`),
       prompt: z
         .string()
         .describe(
@@ -328,8 +363,8 @@ Available subagents:
     }),
     execute: async (input) => {
       const { name, prompt } = input;
-      const def = SUBAGENT_DEFS[name];
-      if (!def) return `Unknown subagent: ${name}`;
+      const def = allAgents[name];
+      if (!def) return `Unknown subagent: ${name}. Available: ${Object.keys(allAgents).join(', ')}`;
 
       const subTodo = new TodoTracker();
       const allBase = createBaseTools(workdir, subTodo);

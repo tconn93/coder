@@ -14,6 +14,8 @@
  */
 import { streamText, stepCountIs } from 'ai';
 import type { ModelMessage } from 'ai';
+import { appendFile, mkdir } from 'fs/promises';
+import { join } from 'path';
 import { getProvider } from '../providers/index.js';
 import { createTools } from './tools.js';
 import { TodoTracker } from './todos.js';
@@ -49,6 +51,27 @@ function estimateCost(model: string, input: number, output: number): number {
 export async function* runAgentLoop(
   options: AgentLoopOptions,
 ): AsyncGenerator<StreamEvent> {
+  // Resolve sessionId upfront — needed for the debug file name
+  const sessionId =
+    options.sessionId ??
+    `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // ---------------------------------------------------------------------------
+  // Debug writer — appends JSONL entries to .coder/convos/<sessionId>.jsonl
+  // ---------------------------------------------------------------------------
+  let debugLog: ((entry: Record<string, unknown>) => Promise<void>) | null = null;
+
+  if (options.debugPrompt) {
+    const convoDir = join(options.workdir, '.coder', 'convos');
+    await mkdir(convoDir, { recursive: true });
+    const debugPath = join(convoDir, `${sessionId}.jsonl`);
+
+    debugLog = async (entry: Record<string, unknown>) => {
+      const line = JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n';
+      await appendFile(debugPath, line, 'utf-8');
+    };
+  }
+
   const todoTracker = new TodoTracker();
   const tokenUsage: TokenUsage = {
     inputTokens: 0,
@@ -63,13 +86,23 @@ export async function* runAgentLoop(
     pendingTodoEvents.push([...todos]);
   });
 
-  const tools = createTools(options.workdir, todoTracker, options.provider);
+  const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents);
 
   // Build the conversation history
   const messages: ModelMessage[] = [
     ...(options.previousMessages as ModelMessage[] ?? []),
     { role: 'user', content: options.prompt },
   ];
+
+  // Log the outgoing request
+  await debugLog?.({
+    type: 'request',
+    sessionId,
+    provider: options.provider,
+    model: options.model,
+    systemPrompt: options.systemPrompt ?? null,
+    messages: messages.filter((m)=> m.role==="user"||m.role==="assistant"||m.role==="system").map((m) => ({ role: m.role, content: m.content  })),
+  });
 
   function* flushTodos(): Generator<StreamEvent> {
     while (pendingTodoEvents.length > 0) {
@@ -99,13 +132,15 @@ export async function* runAgentLoop(
       yield* flushTodos();
 
       switch (part.type) {
-        case 'text-delta':
-          yield { type: 'text', data: (part as { type: 'text-delta'; text: string }).text };
+        case 'text-delta': {
+          const text = (part as { type: 'text-delta'; text: string }).text;
+          yield { type: 'text', data: text };
           break;
+        }
 
         case 'tool-call': {
-          // In v6 tool-call parts can be static (with input) or dynamic
           const toolPart = part as { type: 'tool-call'; toolName: string; input?: unknown };
+          await debugLog?.({ type: 'tool_call', toolName: toolPart.toolName, input: toolPart.input });
           yield {
             type: 'tool_call',
             data: { name: toolPart.toolName, input: toolPart.input },
@@ -122,12 +157,14 @@ export async function* runAgentLoop(
 
         case 'tool-result': {
           const resultPart = part as { type: 'tool-result'; toolName: string; output?: unknown };
+          const outputStr = String(resultPart.output ?? '');
+          await debugLog?.({ type: 'tool_result', toolName: resultPart.toolName, output: outputStr });
           if (options.verbose) {
             yield {
               type: 'tool_result',
               data: {
                 toolName: resultPart.toolName,
-                output: String(resultPart.output ?? '').slice(0, 500),
+                output: outputStr.slice(0, 500),
               },
             };
           }
@@ -140,12 +177,15 @@ export async function* runAgentLoop(
           break;
         }
 
-        case 'error':
+        case 'error': {
+          const errMsg = String((part as { error: unknown }).error);
+          await debugLog?.({ type: 'error', message: errMsg });
           yield {
             type: 'error',
-            data: { message: String((part as { error: unknown }).error), code: 'STREAM_ERROR' },
+            data: { message: errMsg, code: 'STREAM_ERROR' },
           };
           break;
+        }
 
         default:
           // step-start, step-finish, finish, reasoning — no consumer action needed
@@ -168,7 +208,6 @@ export async function* runAgentLoop(
     yield { type: 'token_usage', data: { ...tokenUsage } };
 
     // Collect response messages for session resume
-    // result.response is PromiseLike — wrap in Promise to get .catch()
     const response = await Promise.resolve(result.response).catch(() => ({ messages: [] as ModelMessage[] }));
     const allMessages: ModelMessage[] = [
       ...messages,
@@ -176,9 +215,14 @@ export async function* runAgentLoop(
     ];
 
     const finalText = await result.text;
-    const sessionId =
-      options.sessionId ??
-      `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Log the complete response before emitting done
+    await debugLog?.({
+      type: 'response',
+      text: finalText,
+      tokenUsage: { ...tokenUsage },
+      messages: allMessages.filter((m)=> m.role==="user"||m.role==="assistant").map((m) => ({ role: m.role, content: m.role==="user"?m.content:m.content[0] })),
+    });
 
     yield {
       type: 'done',
@@ -190,12 +234,11 @@ export async function* runAgentLoop(
       },
     };
   } catch (err) {
+    const errMsg = (err as Error).message ?? 'Unknown error';
+    await debugLog?.({ type: 'error', message: errMsg, code: 'AGENT_ERROR' });
     yield {
       type: 'error',
-      data: {
-        message: (err as Error).message ?? 'Unknown error',
-        code: 'AGENT_ERROR',
-      },
+      data: { message: errMsg, code: 'AGENT_ERROR' },
     };
   }
 }

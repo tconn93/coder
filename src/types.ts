@@ -129,6 +129,14 @@ export interface Skill {
   filename: string;
 }
 
+export interface CustomAgentDef {
+  name: string;
+  description: string;
+  model: string;
+  tools: string[];
+  systemPrompt: string;
+}
+
 export interface AgentLoopOptions {
   prompt: string;
   systemPrompt?: string;
@@ -142,4 +150,8 @@ export interface AgentLoopOptions {
   previousMessages?: unknown[];
   /** Session ID to reuse (generated if omitted) */
   sessionId?: string;
+  /** Custom agents loaded from <workdir>/agents/ */
+  customAgents?: CustomAgentDef[];
+  /** When true, write full LLM conversation to <workdir>/.coder/convos/<sessionId>.jsonl */
+  debugPrompt?: boolean;
 }
