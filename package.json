@@ -1,0 +1,37 @@
+{
+  "name": "ai-coding-agent",
+  "version": "1.0.0",
+  "description": "AI Coding Agent powered by Vercel AI SDK",
+  "type": "module",
+  "bin": {
+    "coder": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "latest",
+    "@ai-sdk/google": "latest",
+    "@ai-sdk/openai": "latest",
+    "@ai-sdk/xai": "latest",
+    "ai": "latest",
+    "zod": "^3.23.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "fast-glob": "^3.3.3",
+    "marked": "^12.0.0",
+    "ora": "^8.0.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
