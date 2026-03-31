@@ -33,8 +33,8 @@ const PRICING: Record<string, [number, number]> = {
   'gemini-2.0-flash':  [0.075, 0.3],
   'gemini-2.0-pro':    [1.25,  5],
   'gemini-1.5-flash':  [0.075, 0.3],
-  'grok-2':            [2,     10],
-  'grok-2-mini':       [0.2,   1],
+  'grok-4-1-fast-reasoning': [0.2, 0.5],
+  'grok-4-1-fast-non-reasoning': [0.2, 0.5],
 };
 
 function estimateCost(model: string, input: number, output: number): number {

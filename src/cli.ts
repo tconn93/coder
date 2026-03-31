@@ -1,10 +1,13 @@
 import 'dotenv/config';
+import React from 'react';
+import { render } from 'ink';
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { createInterface } from 'readline';
 import { AgentOrchestrator } from './agent/index.js';
 import { listProviders, getDefaultModel } from './providers/index.js';
+import { App } from './ui/App.js';
 import type {
   AgentOptions,
   StreamEvent,
@@ -46,75 +49,64 @@ function formatTodos(todos: TodoItem[]): string {
   return lines.join('\n');
 }
 
-async function runAgentCLI(
-  prompt: string,
-  options: AgentOptions,
-  verbose: boolean,
-): Promise<void> {
-  const orchestrator = new AgentOrchestrator(options.workdir);
-  const spinner = ora({
-    text: chalk.dim('Agent thinking...'),
-    color: 'cyan',
-    spinner: 'dots',
-  });
-
+/**
+ * Stream agent events to stdout.
+ * Returns the sessionId from the done event (or null on error).
+ */
+async function streamEvents(
+  events: AsyncGenerator<StreamEvent>,
+  opts: { verbose: boolean },
+): Promise<{ sessionId: string | null; tokenUsage: TokenUsage | null; todos: TodoItem[] }> {
+  const spinner = ora({ text: chalk.dim('Thinking...'), color: 'cyan', spinner: 'dots' });
+  let spinnerActive = false;
   let isFirstText = true;
   let lastTodos: TodoItem[] = [];
-  let spinnerActive = false;
+  let resultSessionId: string | null = null;
+  let resultUsage: TokenUsage | null = null;
 
-  console.log(chalk.cyan(`\n[Agent] Working on: ${prompt.slice(0, 80)}...\n`));
+  const stopSpinner = () => {
+    if (spinnerActive) { spinner.stop(); spinnerActive = false; }
+  };
+  const startSpinner = (text?: string) => {
+    if (!spinnerActive) {
+      spinner.text = text ?? chalk.dim('Thinking...');
+      spinner.start();
+      spinnerActive = true;
+    } else if (text) {
+      spinner.text = text;
+    }
+  };
 
-  spinner.start();
-  spinnerActive = true;
+  startSpinner();
 
-  for await (const event of orchestrator.run(prompt, options) as AsyncGenerator<StreamEvent>) {
+  for await (const event of events) {
     switch (event.type) {
       case 'text': {
-        if (spinnerActive) {
-          spinner.stop();
-          spinnerActive = false;
-        }
-        if (isFirstText) {
-          process.stdout.write('\n');
-          isFirstText = false;
-        }
+        stopSpinner();
+        if (isFirstText) { process.stdout.write('\n'); isFirstText = false; }
         process.stdout.write(event.data as string);
         break;
       }
 
       case 'tool_call': {
         const toolData = event.data as { name: string; input: Record<string, unknown> };
-        if (!spinnerActive) {
-          process.stdout.write('\n');
-        } else {
-          spinner.stop();
-          spinnerActive = false;
-        }
-
+        stopSpinner();
+        const inp = toolData.input ?? {};
         let detail = '';
-        const inp = toolData.input;
-        if (inp?.file_path) detail = ` ${chalk.gray(String(inp.file_path))}`;
-        else if (inp?.path) detail = ` ${chalk.gray(String(inp.path))}`;
-        else if (inp?.command) detail = ` ${chalk.gray(String(inp.command).slice(0, 60))}`;
-        else if (inp?.pattern) detail = ` ${chalk.gray(String(inp.pattern))}`;
-        else if (inp?.query) detail = ` ${chalk.gray(String(inp.query).slice(0, 60))}`;
-
-        console.log(
-          chalk.yellow(`  → ${toolData.name}`) + detail,
-        );
-
-        if (!spinnerActive) {
-          spinner.start();
-          spinnerActive = true;
-        }
+        if (inp.path)    detail = ` ${chalk.gray(String(inp.path))}`;
+        else if (inp.command) detail = ` ${chalk.gray(String(inp.command).slice(0, 70))}`;
+        else if (inp.pattern) detail = ` ${chalk.gray(String(inp.pattern))}`;
+        else if (inp.query)   detail = ` ${chalk.gray(String(inp.query).slice(0, 70))}`;
+        console.log(chalk.yellow(`  → ${toolData.name}`) + detail);
+        startSpinner();
         break;
       }
 
       case 'tool_result': {
-        if (verbose) {
-          const result = event.data as { toolName: string; output: string };
-          if (spinnerActive) { spinner.stop(); spinnerActive = false; }
-          console.log(chalk.dim(`    ${result.output.slice(0, 200)}`));
+        if (opts.verbose) {
+          stopSpinner();
+          const r = event.data as { toolName: string; output: string };
+          console.log(chalk.dim(`    ${r.output.slice(0, 200)}`));
         }
         break;
       }
@@ -122,48 +114,33 @@ async function runAgentCLI(
       case 'todo_update': {
         lastTodos = event.data as TodoItem[];
         const display = formatTodos(lastTodos);
-        if (display) {
-          if (spinnerActive) { spinner.stop(); spinnerActive = false; }
-          console.log(display);
-          spinner.start();
-          spinnerActive = true;
-        }
+        if (display) { stopSpinner(); console.log(display); startSpinner(); }
         break;
       }
 
       case 'subagent': {
         const sub = event.data as { name: string; status: string };
-        if (!spinnerActive) {
-          spinner.start();
-          spinnerActive = true;
-        }
-        spinner.text = chalk.dim(`Subagent [${sub.name}]: ${sub.status}...`);
+        startSpinner(chalk.dim(`Subagent [${sub.name}]: ${sub.status}...`));
         break;
       }
 
-      case 'token_usage': {
-        // Will be shown at end
+      case 'token_usage':
+        resultUsage = event.data as TokenUsage;
         break;
-      }
 
       case 'done': {
-        if (spinnerActive) { spinner.stop(); spinnerActive = false; }
+        stopSpinner();
         const done = event.data as { result: string; sessionId: string; tokenUsage: TokenUsage };
-
-        process.stdout.write('\n');
-        console.log(chalk.green('\n[Result]') + ' ' + (done.result ? done.result.slice(0, 200) : 'Done'));
-
-        if (lastTodos.length > 0) {
-          console.log(formatTodos(lastTodos));
-        }
-
+        resultSessionId = done.sessionId;
+        resultUsage = done.tokenUsage;
+        if (!isFirstText) process.stdout.write('\n');
+        if (lastTodos.length > 0) console.log(formatTodos(lastTodos));
         console.log('\n' + formatTokenUsage(done.tokenUsage));
-        console.log(chalk.dim(`[Session] ${done.sessionId}\n`));
         break;
       }
 
       case 'error': {
-        if (spinnerActive) { spinner.stop(); spinnerActive = false; }
+        stopSpinner();
         const err = event.data as { message: string };
         console.error(chalk.red(`\n[Error] ${err.message}\n`));
         break;
@@ -171,88 +148,23 @@ async function runAgentCLI(
     }
   }
 
-  if (spinnerActive) {
-    spinner.stop();
-  }
+  stopSpinner();
+  return { sessionId: resultSessionId, tokenUsage: resultUsage, todos: lastTodos };
 }
 
-async function runREPL(options: AgentOptions): Promise<void> {
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+async function runAgentCLI(
+  prompt: string,
+  options: AgentOptions,
+): Promise<void> {
+  const orchestrator = new AgentOrchestrator(options.workdir);
+  console.log(chalk.cyan(`\n[Agent] ${prompt.slice(0, 100)}\n`));
+  const events = orchestrator.run(prompt, options) as AsyncGenerator<StreamEvent>;
+  const { sessionId } = await streamEvents(events, { verbose: options.verbose ?? false });
+  if (sessionId) console.log(chalk.dim(`[Session] ${sessionId}\n`));
+}
 
-  console.log(chalk.cyan('\n AI Coding Agent — Interactive Mode'));
-  console.log(chalk.gray('Commands: /quit, /help, /todos, /clear, /providers'));
-  console.log(chalk.gray('Press Ctrl+Enter for multiline input\n'));
-
-  const askQuestion = (): Promise<string> => {
-    return new Promise((resolve) => {
-      rl.question(chalk.cyan('> '), (answer) => {
-        resolve(answer);
-      });
-    });
-  };
-
-  while (true) {
-    let input: string;
-    try {
-      input = await askQuestion();
-    } catch {
-      break;
-    }
-
-    input = input.trim();
-    if (!input) continue;
-
-    // Handle special commands
-    if (input === '/quit' || input === '/exit') {
-      console.log(chalk.gray('\nGoodbye!\n'));
-      rl.close();
-      break;
-    }
-
-    if (input === '/help') {
-      console.log(chalk.bold('\nCommands:'));
-      console.log('  /quit, /exit    — Exit the REPL');
-      console.log('  /help           — Show this help');
-      console.log('  /todos          — Show current todo list');
-      console.log('  /clear          — Clear the screen');
-      console.log('  /providers      — List available providers');
-      console.log('\nKeyboard shortcuts:');
-      console.log('  Ctrl+C          — Cancel current run\n');
-      continue;
-    }
-
-    if (input === '/clear') {
-      console.clear();
-      continue;
-    }
-
-    if (input === '/providers') {
-      listProviders();
-      continue;
-    }
-
-    if (input === '/todos') {
-      // Just run a simple message
-      console.log(chalk.gray('(Run a task first to see todos)\n'));
-      continue;
-    }
-
-    if (input.startsWith('/resume ')) {
-      const sessionId = input.slice(8).trim();
-      console.log(chalk.dim(`Resuming session: ${sessionId}`));
-      const nextPrompt = await askQuestion();
-      if (nextPrompt.trim()) {
-        await runAgentCLI(nextPrompt.trim(), options, options.verbose || false);
-      }
-      continue;
-    }
-
-    // Run the agent
-    await runAgentCLI(input, options, options.verbose || false);
-  }
+function runREPL(options: AgentOptions): void {
+  render(React.createElement(App, { options }));
 }
 
 // Main CLI program
@@ -365,7 +277,7 @@ program
 
     // Run with prompt or enter REPL
     if (prompt) {
-      await runAgentCLI(prompt, agentOptions, verbose);
+      await runAgentCLI(prompt, agentOptions);
     } else {
       await runREPL(agentOptions);
     }

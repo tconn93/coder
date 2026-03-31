@@ -76,3 +76,26 @@ A secure boundary that protects your host system
 ## Tracking Token Usage
 
 Track total token usage. 
+
+
+ # Set your API key first
+  cp .env.example .env
+  # Edit .env with your ANTHROPIC_API_KEY
+
+  # One-shot prompt (CLI)
+  npx tsx src/cli.ts "Fix the failing tests in auth.ts"
+
+  # Interactive REPL
+  npx tsx src/cli.ts
+
+  # Web UI (spins up server + opens browser)
+  npx tsx src/cli.ts --web --port 3000
+
+  # Different model/provider
+  npx tsx src/cli.ts --provider openai --model gpt-4o "Review this code"
+
+  # List all providers/models
+  npx tsx src/cli.ts --list-providers
+
+  # Resume a previous session
+  npx tsx src/cli.ts --resume <sessionId>
