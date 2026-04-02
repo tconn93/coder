@@ -10,22 +10,28 @@ import { runAgentLoop } from './loop.js';
 import { SkillsLoader } from './skills.js';
 import { AgentLoader } from './agentLoader.js';
 import { loadProjectConfig } from '../config.js';
+import { MemoryManager } from './memory.js';
+import { NotepadManager } from './notepad.js';
 
 export class AgentOrchestrator {
   private sessions: Map<string, AgentSession> = new Map();
   // Stores message history per session for resume
   private sessionMessages: Map<string, unknown[]> = new Map();
   private skillsLoader: SkillsLoader;
-
   private agentLoader: AgentLoader;
+  private memoryManager: MemoryManager;
+  private notepadManager: NotepadManager;
 
   constructor(workdir?: string) {
+    const wd = workdir ?? process.cwd();
     this.skillsLoader = new SkillsLoader(
       workdir ? join(workdir, 'skills') : undefined,
     );
     this.agentLoader = new AgentLoader(
       workdir ? join(workdir, 'agents') : join(process.cwd(), 'agents'),
     );
+    this.memoryManager = new MemoryManager(wd);
+    this.notepadManager = new NotepadManager(wd);
   }
 
   /**
@@ -71,6 +77,9 @@ export class AgentOrchestrator {
       sessionId,
       customAgents,
       debugPrompt: projectConfig.debugPrompt,
+      budget: options.budget,
+      memoryManager: this.memoryManager,
+      notepadManager: this.notepadManager,
     })) {
       if (event.type === 'token_usage') {
         session.tokenUsage = event.data as TokenUsage;
@@ -118,6 +127,9 @@ export class AgentOrchestrator {
       sessionId,
       customAgents,
       debugPrompt: projectConfig.debugPrompt,
+      budget: options.budget,
+      memoryManager: this.memoryManager,
+      notepadManager: this.notepadManager,
     })) {
       if (event.type === 'done') {
         const done = event.data as { messages?: unknown[] };
@@ -186,6 +198,33 @@ export class AgentOrchestrator {
 
     if (skillsContext) {
       lines.push('', skillsContext);
+    }
+
+    // CLAUDE.md project instructions
+    try {
+      const claudeMd = await readFile(join(options.workdir, 'CLAUDE.md'), 'utf-8');
+      lines.push('', '## Project Instructions', claudeMd.trim());
+    } catch {
+      // No CLAUDE.md
+    }
+
+    // AGENTS.md agent instructions
+    try {
+      const agentsMd = await readFile(join(options.workdir, 'AGENTS.md'), 'utf-8');
+      lines.push('', '## Agent Instructions', agentsMd.trim());
+    } catch {
+      // No AGENTS.md
+    }
+
+    // Memory context
+    try {
+      await this.memoryManager.load();
+      const memorySummary = this.memoryManager.getSummary();
+      if (memorySummary) {
+        lines.push('', '## Memory', memorySummary);
+      }
+    } catch {
+      // Memory unavailable
     }
 
     if (options.systemPromptExtra) {

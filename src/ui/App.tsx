@@ -2,10 +2,14 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { Box, Text, Static, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { join } from 'path';
+import { readFile } from 'fs/promises';
 import type { AgentOptions, StreamEvent, TokenUsage, TodoItem } from '../types.js';
 import { AgentOrchestrator } from '../agent/index.js';
 import { AgentLoader } from '../agent/agentLoader.js';
 import { BUILTIN_AGENTS } from '../agent/tools.js';
+import { SkillsLoader } from '../agent/skills.js';
+import { runRalph } from '../agent/ralph.js';
+import { saveApiKey, setDefaultProvider, getConfiguredProviders } from '../auth.js';
 
 const APP_NAME = "Tyler's AI Company's Coder";
 
@@ -16,12 +20,17 @@ const APP_NAME = "Tyler's AI Company's Coder";
 interface SlashCommand { value: string; label: string; }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-  { value: '/new',    label: 'Start a fresh conversation' },
-  { value: '/agents', label: 'List available subagents'   },
-  { value: '/todos',  label: 'Show current todos'         },
-  { value: '/usage',  label: 'Show token usage'           },
-  { value: '/help',   label: 'Show help'                  },
-  { value: '/quit',   label: 'Exit'                       },
+  { value: '/new',    label: 'Start a fresh conversation'  },
+  { value: '/agents', label: 'List available subagents'    },
+  { value: '/skills', label: 'List available skills'       },
+  { value: '/memory', label: 'Show saved memories'         },
+  { value: '/ralph',  label: 'Run ralph persistence loop'  },
+  { value: '/setup',  label: 'Configure provider API key + set default' },
+  { value: '/auth',   label: 'Show provider auth status'   },
+  { value: '/todos',  label: 'Show current todos'          },
+  { value: '/usage',  label: 'Show token usage'            },
+  { value: '/help',   label: 'Show help'                   },
+  { value: '/quit',   label: 'Exit'                        },
 ];
 
 // ---------------------------------------------------------------------------
@@ -189,6 +198,11 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
 
   // Todos (for /todos command)
   const [todos, setTodos] = useState<TodoItem[]>([]);
+
+  // Setup wizard state
+  type SetupStep = 'idle' | 'select-provider' | 'enter-key' | 'set-default';
+  interface SetupState { step: SetupStep; selectedProvider: string; enteredKey: string; }
+  const [setupState, setSetupState] = useState<SetupState>({ step: 'idle', selectedProvider: '', enteredKey: '' });
 
   // Stable refs — safe to read inside async callbacks
   const orchestratorRef = useRef(new AgentOrchestrator(options.workdir));
@@ -371,16 +385,158 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
       return;
     }
 
+    if (trimmed === '/setup') {
+      const providerList = ['anthropic', 'openai', 'google', 'xai'];
+      setSetupState({ step: 'select-provider', selectedProvider: '', enteredKey: '' });
+      setCompletedMessages((prev) => [...prev, {
+        id: genId(), role: 'system',
+        content: [
+          'Provider setup wizard',
+          '',
+          'Available providers:',
+          ...providerList.map((p, i) => `  ${i + 1}. ${p}`),
+          '',
+          'Enter provider name or number:',
+        ].join('\n'),
+        toolCalls: [],
+      }]);
+      return;
+    }
+
+    if (trimmed === '/auth') {
+      const configured = getConfiguredProviders();
+      const lines: string[] = ['Provider auth status:'];
+      const all = ['anthropic', 'openai', 'google', 'xai'];
+      for (const p of all) {
+        const ok = configured.includes(p);
+        lines.push(`  ${ok ? '✓' : '✗'} ${p}${ok ? ' (configured)' : ' (not set)'}`);
+      }
+      lines.push('');
+      lines.push("To add or remove keys, run 'coder auth' in your terminal.");
+      setCompletedMessages((prev) => [...prev, {
+        id: genId(), role: 'system', content: lines.join('\n'), toolCalls: [],
+      }]);
+      return;
+    }
+
+    if (trimmed === '/skills') {
+      const loader = new SkillsLoader(join(options.workdir, 'skills'));
+      loader.loadAll().then((skills) => {
+        if (skills.length === 0) {
+          setCompletedMessages((prev) => [...prev, {
+            id: genId(), role: 'system', content: '(no skills found)', toolCalls: [],
+          }]);
+          return;
+        }
+        const lines: string[] = ['Available skills:'];
+        for (const s of skills) {
+          lines.push(`  ${s.frontmatter.name.padEnd(20)} ${s.frontmatter.description}`);
+          if (s.frontmatter.keywords) {
+            lines.push(`  ${''.padEnd(20)} keywords: ${s.frontmatter.keywords}`);
+          }
+        }
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system', content: lines.join('\n'), toolCalls: [],
+        }]);
+      });
+      return;
+    }
+
+    if (trimmed === '/memory') {
+      const memoryIndexPath = join(options.workdir, '.coder', 'memory', 'MEMORY.md');
+      readFile(memoryIndexPath, 'utf-8').then((content) => {
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system', content: content || '(memory index is empty)', toolCalls: [],
+        }]);
+      }).catch(() => {
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system', content: '(no memory found — use memory_write tool to save memories)', toolCalls: [],
+        }]);
+      });
+      return;
+    }
+
+    if (trimmed.startsWith('/ralph ') || trimmed === '/ralph') {
+      const ralphPrompt = trimmed.slice('/ralph'.length).trim();
+      if (!ralphPrompt) {
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system', content: 'Usage: /ralph <prompt>', toolCalls: [],
+        }]);
+        return;
+      }
+      // Run ralph by pushing a special marker that runTurn will detect
+      // Instead, run it directly via the queue with a prefixed message
+      const runRalphAsync = async () => {
+        setIsThinking(true);
+        setCurrentTool(null);
+        setStreamingContent('');
+        setStreamingTools([]);
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'user', content: `/ralph ${ralphPrompt}`, toolCalls: [],
+        }]);
+
+        let text = '';
+        const tools: string[] = [];
+        try {
+          for await (const event of runRalph({ prompt: ralphPrompt, agentOptions: options })) {
+            switch (event.type) {
+              case 'text':
+                text += event.data as string;
+                setStreamingContent(text);
+                break;
+              case 'tool_call': {
+                const name = (event.data as { name: string }).name;
+                tools.push(name);
+                setCurrentTool(name);
+                setStreamingTools([...tools]);
+                break;
+              }
+              case 'token_usage': {
+                const u = event.data as TokenUsage;
+                setTotalTokens((n) => n + u.totalTokens);
+                setTotalCost((c) => c + u.costUsd);
+                break;
+              }
+              case 'error': {
+                const err = event.data as { message: string };
+                text += `\nError: ${err.message}`;
+                setStreamingContent(text);
+                break;
+              }
+            }
+          }
+        } catch (err) {
+          text += `\nError: ${(err as Error).message}`;
+          setStreamingContent(text);
+        }
+        setStreamingContent('');
+        setStreamingTools([]);
+        setCurrentTool(null);
+        setIsThinking(false);
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'assistant', content: text || '(no response)', toolCalls: tools,
+        }]);
+      };
+      runRalphAsync().catch(() => {});
+      return;
+    }
+
     if (trimmed === '/help') {
       setCompletedMessages((prev) => [...prev, {
         id: genId(), role: 'system',
         content: [
-          '/new     — start a fresh conversation',
-          '/agents  — list available subagents',
-          '/todos   — show current todos',
-          '/usage   — show token usage',
-          '/quit    — exit',
+          '/new          — start a fresh conversation',
+          '/agents       — list available subagents',
+          '/skills       — list available skills',
+          '/memory       — show saved memories',
+          '/ralph <prompt> — run ralph persistence loop',
+          '/setup        — configure provider API key + set default',
+          '/auth         — show provider auth status',
+          '/todos        — show current todos',
+          '/usage        — show token usage',
+          '/quit         — exit',
           '',
+          "To add API keys: run 'coder auth' in your terminal.",
           'Tip: type / to browse commands with ↑↓ arrow keys, Enter to select.',
           'Messages sent while the agent is thinking are queued automatically.',
         ].join('\n'),
@@ -404,8 +560,55 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
     setInputValue('');
     setPickerFilter('');
     setPickerIndex(0);
+
+    // Wizard interception
+    if (setupState.step !== 'idle') {
+      const trimmedVal = value.trim();
+      const providerList = ['anthropic', 'openai', 'google', 'xai'];
+
+      if (setupState.step === 'select-provider') {
+        const idx = parseInt(trimmedVal, 10);
+        const provider = isNaN(idx) ? trimmedVal.toLowerCase() : providerList[idx - 1];
+        if (!provider || !providerList.includes(provider)) {
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `Unknown provider: ${trimmedVal}. Try again:`, toolCalls: [] }]);
+          return;
+        }
+        setSetupState((s) => ({ ...s, step: 'enter-key', selectedProvider: provider }));
+        setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `API key for ${provider}:`, toolCalls: [] }]);
+        return;
+      }
+
+      if (setupState.step === 'enter-key') {
+        if (!trimmedVal) {
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: 'No key entered. Setup cancelled.', toolCalls: [] }]);
+          setSetupState({ step: 'idle', selectedProvider: '', enteredKey: '' });
+          return;
+        }
+        setSetupState((s) => ({ ...s, step: 'set-default', enteredKey: trimmedVal }));
+        setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `Set '${setupState.selectedProvider}' as default provider? (y/n)`, toolCalls: [] }]);
+        return;
+      }
+
+      if (setupState.step === 'set-default') {
+        const { selectedProvider, enteredKey } = setupState;
+        setSetupState({ step: 'idle', selectedProvider: '', enteredKey: '' });
+        saveApiKey(selectedProvider, enteredKey).then(async () => {
+          const lines = [`✓ API key saved for '${selectedProvider}'`];
+          if (trimmedVal.toLowerCase() !== 'n') {
+            await setDefaultProvider(selectedProvider);
+            lines.push(`✓ Set '${selectedProvider}' as default provider`);
+          }
+          lines.push('', 'Setup complete! Restart the agent to use the new provider.');
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: lines.join('\n'), toolCalls: [] }]);
+        }).catch((err: Error) => {
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `Setup error: ${err.message}`, toolCalls: [] }]);
+        });
+        return;
+      }
+    }
+
     runCommand(value.trim());
-  }, [runCommand]);
+  }, [runCommand, setupState]);
 
   // Keyboard handler — placed after handleSubmit/runCommand to avoid TS "used before declaration"
   useInput((_input, key) => {

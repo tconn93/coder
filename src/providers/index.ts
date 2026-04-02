@@ -11,6 +11,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createXai } from '@ai-sdk/xai';
 import { streamText } from 'ai';
 import type { LanguageModel } from 'ai';
+import { getApiKey } from '../auth.js';
 
 export interface ProviderConfig {
   models: string[];
@@ -41,30 +42,30 @@ export function getProvider(provider: string, model: string): LanguageModel {
 
   switch (normalizedProvider) {
     case 'anthropic': {
-      const client = createAnthropic({
-        apiKey: process.env.ANTHROPIC_API_KEY,
-      });
+      const apiKey = getApiKey('anthropic') ?? process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'anthropic'. Run `coder auth` to set one up.");
+      const client = createAnthropic({ apiKey });
       return client(model);
     }
 
     case 'openai': {
-      const client = createOpenAI({
-        apiKey: process.env.OPENAI_API_KEY,
-      });
+      const apiKey = getApiKey('openai') ?? process.env.OPENAI_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'openai'. Run `coder auth` to set one up.");
+      const client = createOpenAI({ apiKey });
       return client(model);
     }
 
     case 'google': {
-      const client = createGoogleGenerativeAI({
-        apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-      });
+      const apiKey = getApiKey('google') ?? process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'google'. Run `coder auth` to set one up.");
+      const client = createGoogleGenerativeAI({ apiKey });
       return client(model);
     }
 
     case 'xai': {
-      const client = createXai({
-        apiKey: process.env.XAI_API_KEY,
-      });
+      const apiKey = getApiKey('xai') ?? process.env.XAI_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'xai'. Run `coder auth` to set one up.");
+      const client = createXai({ apiKey });
       return client(model);
     }
 

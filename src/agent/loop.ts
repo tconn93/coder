@@ -86,7 +86,7 @@ export async function* runAgentLoop(
     pendingTodoEvents.push([...todos]);
   });
 
-  const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents);
+  const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents, options.memoryManager, options.notepadManager);
 
   // Build the conversation history
   const messages: ModelMessage[] = [
@@ -111,6 +111,8 @@ export async function* runAgentLoop(
   }
 
   try {
+    let budgetExceeded = false;
+
     const result = streamText({
       model: getProvider(options.provider, options.model),
       system: options.systemPrompt,
@@ -125,11 +127,24 @@ export async function* runAgentLoop(
           tokenUsage.outputTokens += usage.outputTokens ?? 0;
           tokenUsage.totalTokens += (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
         }
+        tokenUsage.costUsd = estimateCost(options.model, tokenUsage.inputTokens, tokenUsage.outputTokens);
+        const budget = options.budget ?? 5.0;
+        if (tokenUsage.costUsd > budget) {
+          budgetExceeded = true;
+        }
       },
     });
 
     for await (const part of result.fullStream) {
       yield* flushTodos();
+
+      if (budgetExceeded) {
+        yield {
+          type: 'error',
+          data: { message: `Budget limit of $${(options.budget ?? 5.0).toFixed(2)} exceeded (spent $${tokenUsage.costUsd.toFixed(4)})`, code: 'BUDGET_EXCEEDED' },
+        };
+        break;
+      }
 
       switch (part.type) {
         case 'text-delta': {

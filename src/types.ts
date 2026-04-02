@@ -121,12 +121,23 @@ export interface SkillFrontmatter {
   name: string;
   description: string;
   when_to_use: string;
+  keywords?: string;
 }
 
 export interface Skill {
   frontmatter: SkillFrontmatter;
   content: string;
   filename: string;
+}
+
+export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
+
+export interface MemoryEntry {
+  name: string;
+  description: string;
+  type: MemoryType;
+  body: string;
+  file: string;
 }
 
 export interface CustomAgentDef {
@@ -154,4 +165,10 @@ export interface AgentLoopOptions {
   customAgents?: CustomAgentDef[];
   /** When true, write full LLM conversation to <workdir>/.coder/convos/<sessionId>.jsonl */
   debugPrompt?: boolean;
+  /** Cost ceiling in USD (default 5.0) */
+  budget?: number;
+  /** Memory manager instance for persistent memory tools */
+  memoryManager?: import('./agent/memory.js').MemoryManager;
+  /** Notepad manager instance for notepad tools */
+  notepadManager?: import('./agent/notepad.js').NotepadManager;
 }

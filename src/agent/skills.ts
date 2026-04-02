@@ -63,6 +63,7 @@ export class SkillsLoader {
               name: frontmatter.name || filename.replace('.md', ''),
               description: frontmatter.description || '',
               when_to_use: frontmatter.when_to_use || '',
+              keywords: frontmatter.keywords,
             },
             content: body,
             filename,
@@ -86,7 +87,7 @@ export class SkillsLoader {
 
   /**
    * Returns a formatted string summarizing available skills to inject into the system prompt.
-   * Only includes name, description, and when_to_use — not full content.
+   * Only includes name, description, when_to_use, and keywords — not full content.
    */
   getSystemPromptAddition(): string {
     if (this.skills.length === 0) return '';
@@ -104,10 +105,28 @@ export class SkillsLoader {
       if (skill.frontmatter.when_to_use) {
         lines.push(`**When to use:** ${skill.frontmatter.when_to_use}`);
       }
+      if (skill.frontmatter.keywords) {
+        lines.push(`**Keywords:** ${skill.frontmatter.keywords}`);
+      }
       lines.push('');
     }
 
     return lines.join('\n');
+  }
+
+  /**
+   * Returns a map of keyword → skill name for auto-triggering skills.
+   */
+  getKeywordTriggers(): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const skill of this.skills) {
+      if (skill.frontmatter.keywords) {
+        for (const kw of skill.frontmatter.keywords.split(',').map(k => k.trim()).filter(Boolean)) {
+          map.set(kw.toLowerCase(), skill.frontmatter.name);
+        }
+      }
+    }
+    return map;
   }
 
   /**

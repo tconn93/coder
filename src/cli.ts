@@ -8,10 +8,11 @@ import { createInterface } from 'readline';
 import { join, relative } from 'path';
 import { generateText } from 'ai';
 import { AgentOrchestrator } from './agent/index.js';
-import { listProviders, getDefaultModel } from './providers/index.js';
+import { listProviders, getDefaultModel, SUPPORTED_PROVIDERS } from './providers/index.js';
 import { getProvider } from './providers/index.js';
 import { AgentLoader } from './agent/agentLoader.js';
 import { BUILTIN_AGENTS } from './agent/tools.js';
+import { saveApiKey, removeApiKey, getConfiguredProviders, getAuthFilePath, getDefaultProviderSetting, getDefaultModelSetting } from './auth.js';
 import { App } from './ui/App.js';
 import type {
   AgentOptions,
@@ -203,11 +204,6 @@ async function listAgents(workdir: string): Promise<void> {
 }
 
 async function createAgent(workdir: string, provider: string, model: string): Promise<void> {
-  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
-    console.error(chalk.red('\nError: ANTHROPIC_API_KEY environment variable is not set.\n'));
-    process.exit(1);
-  }
-
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = (q: string) => new Promise<string>((r) => rl.question(q, r));
 
@@ -315,8 +311,8 @@ program
   .argument('[prompt]', 'Prompt to run (if omitted, starts interactive REPL)')
   .option('--web', 'Start web UI server')
   .option('--port <number>', 'Web server port', '3000')
-  .option('--provider <name>', 'LLM provider: anthropic|openai|google|xai', process.env.DEFAULT_PROVIDER ?? 'anthropic')
-  .option('--model <model>', 'Model name (default: provider default, or DEFAULT_MODEL env var)')
+  .option('--provider <name>', 'LLM provider: anthropic|openai|google|xai')
+  .option('--model <model>', 'Model name (default: provider default)')
   .option('--max-turns <n>', 'Maximum agent turns', '50')
   .option('--budget <usd>', 'Maximum budget in USD', '5.00')
   .option(
@@ -328,6 +324,8 @@ program
   .option('--working-dir <path>', 'Working directory (alias for --workdir)')
   .option('--resume <id>', 'Resume a previous session')
   .option('--list-providers', 'List available providers and models')
+  .option('--ralph', 'Run with ralph persistence loop (retry until verified)')
+  .option('--max-ralph-iterations <n>', 'Max iterations for ralph mode (default: 5)', '5')
   .option('-v, --verbose', 'Verbose output (show all tool results)')
   .action(async (prompt: string | undefined, opts: Record<string, string | boolean>) => {
     // Handle --list-providers
@@ -336,8 +334,8 @@ program
       process.exit(0);
     }
 
-    const provider = String(opts['provider'] || process.env.DEFAULT_PROVIDER || 'anthropic');
-    const model = String(opts['model'] || process.env.DEFAULT_MODEL || getDefaultModel(provider));
+    const provider = (opts['provider'] as string | undefined) || getDefaultProviderSetting() || process.env['DEFAULT_PROVIDER'] || 'anthropic';
+    const model = (opts['model'] as string | undefined) || getDefaultModelSetting() || process.env['DEFAULT_MODEL'] || getDefaultModel(provider);
     const maxTurns = parseInt(String(opts['maxTurns'] || '50'));
     const budget = parseFloat(String(opts['budget'] || '5.00'));
     const permissionMode = String(opts['permissionMode'] || 'acceptEdits') as PermissionMode;
@@ -354,14 +352,6 @@ program
       workdir,
       verbose,
     };
-
-    // Validate API key for Anthropic
-    if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
-      console.error(chalk.red('\nError: ANTHROPIC_API_KEY environment variable is not set.'));
-      console.error(chalk.gray('Set it in your .env file or environment:\n'));
-      console.error(chalk.gray('  export ANTHROPIC_API_KEY=your_key_here\n'));
-      process.exit(1);
-    }
 
     // Handle --web flag
     if (opts['web']) {
@@ -414,6 +404,16 @@ program
       return;
     }
 
+    // Handle --ralph flag
+    if (opts['ralph'] && prompt) {
+      const { runRalph } = await import('./agent/ralph.js');
+      const maxRalphIterations = parseInt(String(opts['maxRalphIterations'] || '5'));
+      console.log(chalk.cyan(`\n[Ralph] Starting persistence loop for: ${prompt.slice(0, 100)}\n`));
+      const events = runRalph({ prompt, agentOptions, maxIterations: maxRalphIterations });
+      await streamEvents(events, { verbose: agentOptions.verbose ?? false });
+      return;
+    }
+
     // Run with prompt or enter REPL
     if (prompt) {
       await runAgentCLI(prompt, agentOptions);
@@ -430,12 +430,12 @@ program
   .description("Manage subagents: 'list' (default) or 'create'")
   .option('--workdir <path>', 'Working directory', process.cwd())
   .option('--working-dir <path>', 'Working directory (alias for --workdir)')
-  .option('--provider <name>', 'LLM provider for agent creation', process.env.DEFAULT_PROVIDER ?? 'anthropic')
+  .option('--provider <name>', 'LLM provider for agent creation')
   .option('--model <name>', 'Model for agent creation')
   .action(async (action: string | undefined, opts: Record<string, string>) => {
     const workdir = String(opts['workingDir'] || opts['workdir'] || process.cwd());
-    const provider = String(opts['provider'] || 'anthropic');
-    const model = String(opts['model'] || getDefaultModel(provider));
+    const provider = (opts['provider'] as string | undefined) || getDefaultProviderSetting() || process.env['DEFAULT_PROVIDER'] || 'anthropic';
+    const model = (opts['model'] as string | undefined) || getDefaultModelSetting() || process.env['DEFAULT_MODEL'] || getDefaultModel(provider);
 
     if (!action || action === 'list') {
       await listAgents(workdir);
@@ -445,6 +445,198 @@ program
       console.error(chalk.red(`\nUnknown action '${action}'. Use 'list' or 'create'.\n`));
       process.exit(1);
     }
+  });
+
+// ---------------------------------------------------------------------------
+// auth subcommand
+// ---------------------------------------------------------------------------
+program
+  .command('auth [action]')
+  .description("Manage provider API keys: 'list' (default), 'add', or 'remove'")
+  .action(async (action: string | undefined) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q: string) => new Promise<string>((resolve) => rl.question(q, resolve));
+
+    const providerNames = Object.keys(SUPPORTED_PROVIDERS);
+
+    if (!action || action === 'list') {
+      const configured = getConfiguredProviders();
+      console.log(chalk.bold(`\nConfigured providers`) + chalk.gray(` (${getAuthFilePath()}):\n`));
+      for (const p of providerNames) {
+        const hasKey = configured.includes(p);
+        const status = hasKey ? chalk.green('✓ configured') : chalk.gray('✗ not set');
+        console.log(`  ${chalk.cyan(p.padEnd(12))} ${status}`);
+      }
+      if (configured.length === 0) {
+        console.log(chalk.gray('\n  No keys configured. Run `coder auth add` to add one.\n'));
+      } else {
+        console.log('');
+      }
+      rl.close();
+      return;
+    }
+
+    if (action === 'add') {
+      console.log(chalk.cyan('\nAdd a provider API key\n'));
+      console.log('Available providers:\n');
+      providerNames.forEach((p, i) => console.log(`  ${i + 1}. ${p}`));
+      const choice = (await ask(chalk.bold('\nProvider (name or number): '))).trim();
+      rl.close();
+
+      const providerIndex = parseInt(choice, 10);
+      const provider = isNaN(providerIndex)
+        ? choice.toLowerCase()
+        : providerNames[providerIndex - 1];
+
+      if (!provider || !SUPPORTED_PROVIDERS[provider]) {
+        console.error(chalk.red(`\nUnknown provider: ${choice}\n`));
+        process.exit(1);
+      }
+
+      // Re-open rl for key entry (so we can close cleanly)
+      const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+      const apiKey = (
+        await new Promise<string>((resolve) =>
+          rl2.question(chalk.bold(`API key for ${provider}: `), resolve),
+        )
+      ).trim();
+      rl2.close();
+
+      if (!apiKey) {
+        console.log(chalk.gray('\nCancelled.\n'));
+        return;
+      }
+
+      await saveApiKey(provider, apiKey);
+      console.log(chalk.green(`\n✓ API key saved for '${provider}' → ${getAuthFilePath()}\n`));
+      return;
+    }
+
+    if (action === 'remove') {
+      const configured = getConfiguredProviders();
+      if (configured.length === 0) {
+        console.log(chalk.gray('\nNo API keys configured.\n'));
+        rl.close();
+        return;
+      }
+
+      console.log(chalk.cyan('\nRemove a provider API key\n'));
+      configured.forEach((p, i) => console.log(`  ${i + 1}. ${p}`));
+      const choice = (await ask(chalk.bold('\nProvider to remove (name or number): '))).trim();
+      rl.close();
+
+      const idx = parseInt(choice, 10);
+      const provider = isNaN(idx) ? choice.toLowerCase() : configured[idx - 1];
+
+      if (!provider || !configured.includes(provider)) {
+        console.error(chalk.red(`\nProvider not found: ${choice}\n`));
+        process.exit(1);
+      }
+
+      await removeApiKey(provider);
+      console.log(chalk.green(`\n✓ Removed API key for '${provider}'\n`));
+      return;
+    }
+
+    rl.close();
+    console.error(chalk.red(`\nUnknown action '${action}'. Use: list, add, remove\n`));
+    process.exit(1);
+  });
+
+// ---------------------------------------------------------------------------
+// setup subcommand
+// ---------------------------------------------------------------------------
+program
+  .command('setup')
+  .description('Interactive wizard to configure LLM provider API keys and defaults')
+  .action(async () => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q: string) => new Promise<string>((resolve) => rl.question(q, resolve));
+
+    console.log(chalk.cyan('\n╔══════════════════════════════╗'));
+    console.log(chalk.cyan('║   LLM Provider Setup Wizard  ║'));
+    console.log(chalk.cyan('╚══════════════════════════════╝\n'));
+    console.log(chalk.gray(`Settings stored in: ${getAuthFilePath()}\n`));
+
+    const providerNames = Object.keys(SUPPORTED_PROVIDERS);
+    const configured = getConfiguredProviders();
+    const currentDefault = getDefaultProviderSetting();
+
+    // Show current status
+    console.log(chalk.bold('Current status:\n'));
+    for (const p of providerNames) {
+      const hasKey = configured.includes(p);
+      const isDefault = currentDefault === p;
+      const status = hasKey ? chalk.green('✓ configured') : chalk.gray('✗ not set');
+      const defMark = isDefault ? chalk.cyan(' (default)') : '';
+      console.log(`  ${chalk.cyan(p.padEnd(12))} ${status}${defMark}`);
+    }
+    console.log('');
+
+    // Provider selection
+    console.log('Providers:');
+    providerNames.forEach((p, i) => {
+      console.log(`  ${i + 1}. ${p}${configured.includes(p) ? chalk.green(' ✓') : ''}`);
+    });
+    console.log('  0. Exit\n');
+
+    const choice = (await ask(chalk.bold('Select provider (number or name): '))).trim();
+
+    if (!choice || choice === '0') {
+      console.log(chalk.gray('\nExiting setup.\n'));
+      rl.close();
+      return;
+    }
+
+    const idx = parseInt(choice, 10);
+    const provider = isNaN(idx) ? choice.toLowerCase() : providerNames[idx - 1];
+
+    if (!provider || !SUPPORTED_PROVIDERS[provider]) {
+      console.error(chalk.red(`\nUnknown provider: ${choice}\n`));
+      rl.close();
+      process.exit(1);
+    }
+
+    const apiKey = (await ask(chalk.bold(`\nAPI key for ${chalk.cyan(provider)}: `))).trim();
+    if (!apiKey) {
+      console.log(chalk.gray('\nNo key entered. Exiting.\n'));
+      rl.close();
+      return;
+    }
+
+    await saveApiKey(provider, apiKey);
+    console.log(chalk.green(`\n✓ API key saved for '${provider}'\n`));
+
+    const setDefAnswer = (await ask(
+      chalk.bold(`Set '${provider}' as default provider?`) +
+      (currentDefault ? chalk.gray(` (current: ${currentDefault})`) : '') +
+      ' [Y/n] '
+    )).trim().toLowerCase();
+
+    if (setDefAnswer !== 'n') {
+      const { setDefaultProvider, setDefaultModel } = await import('./auth.js');
+      await setDefaultProvider(provider);
+      console.log(chalk.green(`✓ Default provider → '${provider}'\n`));
+
+      const models = SUPPORTED_PROVIDERS[provider].models;
+      console.log(`Models for ${chalk.cyan(provider)}:`);
+      models.forEach((m, i) => {
+        const rec = m === SUPPORTED_PROVIDERS[provider].defaultModel;
+        console.log(`  ${i + 1}. ${m}${rec ? chalk.gray(' (recommended)') : ''}`);
+      });
+
+      const modelChoice = (await ask(chalk.bold('\nSelect model (number/name, Enter = recommended): '))).trim();
+      const mIdx = parseInt(modelChoice, 10);
+      const chosenModel = modelChoice
+        ? (isNaN(mIdx) ? modelChoice : models[mIdx - 1]) ?? SUPPORTED_PROVIDERS[provider].defaultModel
+        : SUPPORTED_PROVIDERS[provider].defaultModel;
+
+      await setDefaultModel(chosenModel);
+      console.log(chalk.green(`✓ Default model → '${chosenModel}'\n`));
+    }
+
+    console.log(chalk.cyan('Setup complete! Run `coder` to start.\n'));
+    rl.close();
   });
 
 program.parseAsync(process.argv).catch((err) => {
