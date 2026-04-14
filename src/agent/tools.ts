@@ -174,6 +174,29 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
 }
 
+/**
+ * Normalizes double-encoded escape sequences that can occur when an LLM
+ * emits double-escaped JSON in tool call arguments.
+ *
+ * Only activates when the string has no real newlines but contains literal
+ * backslash-n/t/r sequences — the fingerprint of double encoding.
+ *
+ * Does NOT modify strings that already contain real newlines (i.e., where
+ * JSON.parse already decoded correctly).
+ */
+function normalizeEscapeSequences(str: string): string {
+  const hasRealNewline = str.includes('\n');
+  const hasLiteralEscape = /\\[ntr]/.test(str);
+
+  if (!hasRealNewline && hasLiteralEscape) {
+    return str
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t')
+      .replace(/\\r/g, '\r');
+  }
+  return str;
+}
+
 // ---------------------------------------------------------------------------
 // Base tools (no spawn_subagent — safe to use inside subagent contexts)
 // ---------------------------------------------------------------------------
@@ -219,7 +242,7 @@ export function createBaseTools(
       }),
       execute: async (input) => {
         const { path } = input;
-        const content = decodeHtmlEntities(input.content);
+        const content = normalizeEscapeSequences(decodeHtmlEntities(input.content));
         const filePath = resolve(workdir, path);
         try {
           await fs.mkdir(dirname(filePath), { recursive: true });
@@ -245,8 +268,8 @@ export function createBaseTools(
       }),
       execute: async (input) => {
         const { path, replace_all } = input;
-        const old_string = decodeHtmlEntities(input.old_string);
-        const new_string = decodeHtmlEntities(input.new_string);
+        const old_string = normalizeEscapeSequences(decodeHtmlEntities(input.old_string));
+        const new_string = normalizeEscapeSequences(decodeHtmlEntities(input.new_string));
         const filePath = resolve(workdir, path);
         try {
           const content = await fs.readFile(filePath, 'utf-8');
