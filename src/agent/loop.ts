@@ -14,11 +14,12 @@
  */
 import { streamText, stepCountIs } from 'ai';
 import type { ModelMessage } from 'ai';
-import { appendFile, mkdir } from 'fs/promises';
+import { appendFile, mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { getProvider } from '../providers/index.js';
 import { createTools } from './tools.js';
 import { TodoTracker } from './todos.js';
+import { routerMiddleware } from './router.js';
 import type { StreamEvent, AgentLoopOptions, TokenUsage, TodoItem } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ const PRICING: Record<string, [number, number]> = {
   'gemini-1.5-flash':  [0.075, 0.3],
   'grok-4-1-fast-reasoning': [0.2, 0.5],
   'grok-4-1-fast-non-reasoning': [0.2, 0.5],
+  'grok-4-20-reasoning': [0.5, 1.5],
+  'grok-4-20-non-reasoning': [0.5, 1.5],
 };
 
 function estimateCost(model: string, input: number, output: number): number {
@@ -64,11 +67,13 @@ export async function* runAgentLoop(
   if (options.debugPrompt) {
     const convoDir = join(options.workdir, '.coder', 'convos');
     await mkdir(convoDir, { recursive: true });
-    const debugPath = join(convoDir, `${sessionId}.jsonl`);
+    const debugPath = join(convoDir, `${sessionId}.json`);
+
+    const logArray: Record<string, unknown>[] = [];
 
     debugLog = async (entry: Record<string, unknown>) => {
-      const line = JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n';
-      await appendFile(debugPath, line, 'utf-8');
+      logArray.push({ ...entry, ts: new Date().toISOString() });
+      await writeFile(debugPath, JSON.stringify(logArray, null, 2), 'utf-8');
     };
   }
 
@@ -88,20 +93,40 @@ export async function* runAgentLoop(
 
   const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents, options.memoryManager, options.notepadManager);
 
-  // Build the conversation history
-  const messages: ModelMessage[] = [
+  // Build the raw conversation history (to save for full session transcript)
+  const rawMessages: ModelMessage[] = [
     ...(options.previousMessages as ModelMessage[] ?? []),
     { role: 'user', content: options.prompt },
   ];
+
+  // Pass history through the Intelligent Context Router to save tokens
+  const previousMessagesArray = options.previousMessages as ModelMessage[] ?? [];
+  const { leanPrompt, targetProvider, targetModel, triageData } = await routerMiddleware(
+    options.prompt, 
+    previousMessagesArray,
+    options.provider,
+    options.model,
+    options.memoryManager
+  );
+
+  // The actual mapped payload reducing context bloat for this request
+  const routedMessages: ModelMessage[] = [
+    { role: 'user', content: leanPrompt }
+  ];
+
+  // Use the routed overriding provider/model, or fallback to user options
+  const activeProvider = targetProvider || options.provider;
+  const activeModel = targetModel || options.model;
 
   // Log the outgoing request
   await debugLog?.({
     type: 'request',
     sessionId,
-    provider: options.provider,
-    model: options.model,
+    provider: activeProvider,
+    model: activeModel,
     systemPrompt: options.systemPrompt ?? null,
-    messages: messages.filter((m)=> m.role==="user"||m.role==="assistant"||m.role==="system").map((m) => ({ role: m.role, content: m.content  })),
+    userRequest: options.prompt,
+    triageData,
   });
 
   function* flushTodos(): Generator<StreamEvent> {
@@ -114,9 +139,9 @@ export async function* runAgentLoop(
     let budgetExceeded = false;
 
     const result = streamText({
-      model: getProvider(options.provider, options.model),
+      model: getProvider(activeProvider, activeModel),
       system: options.systemPrompt,
-      messages,
+      messages: routedMessages,
       tools,
       // Stop after maxTurns tool-use steps (default 50)
       stopWhen: stepCountIs(options.maxTurns ?? 50),
@@ -225,7 +250,7 @@ export async function* runAgentLoop(
     // Collect response messages for session resume
     const response = await Promise.resolve(result.response).catch(() => ({ messages: [] as ModelMessage[] }));
     const allMessages: ModelMessage[] = [
-      ...messages,
+      ...rawMessages,
       ...(response.messages as ModelMessage[]),
     ];
 
@@ -236,7 +261,6 @@ export async function* runAgentLoop(
       type: 'response',
       text: finalText,
       tokenUsage: { ...tokenUsage },
-      messages: allMessages.filter((m)=> m.role==="user"||m.role==="assistant").map((m) => ({ role: m.role, content: m.role==="user"?m.content:m.content[0] })),
     });
 
     yield {

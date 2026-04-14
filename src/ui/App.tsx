@@ -9,7 +9,10 @@ import { AgentLoader } from '../agent/agentLoader.js';
 import { BUILTIN_AGENTS } from '../agent/tools.js';
 import { SkillsLoader } from '../agent/skills.js';
 import { runRalph } from '../agent/ralph.js';
-import { saveApiKey, setDefaultProvider, getConfiguredProviders } from '../auth.js';
+import { saveApiKey, setDefaultProvider, getConfiguredProviders, setDefaultModel } from '../auth.js';
+import { SUPPORTED_PROVIDERS } from '../providers/index.js';
+import { marked } from 'marked';
+import type { Token } from 'marked';
 
 const APP_NAME = "Tyler's AI Company's Coder";
 
@@ -20,17 +23,19 @@ const APP_NAME = "Tyler's AI Company's Coder";
 interface SlashCommand { value: string; label: string; }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-  { value: '/new',    label: 'Start a fresh conversation'  },
-  { value: '/agents', label: 'List available subagents'    },
-  { value: '/skills', label: 'List available skills'       },
-  { value: '/memory', label: 'Show saved memories'         },
-  { value: '/ralph',  label: 'Run ralph persistence loop'  },
-  { value: '/setup',  label: 'Configure provider API key + set default' },
-  { value: '/auth',   label: 'Show provider auth status'   },
-  { value: '/todos',  label: 'Show current todos'          },
-  { value: '/usage',  label: 'Show token usage'            },
-  { value: '/help',   label: 'Show help'                   },
-  { value: '/quit',   label: 'Exit'                        },
+  { value: '/new',       label: 'Start a fresh conversation'  },
+  { value: '/provider',  label: 'Update default provider & model' },
+  { value: '/model',     label: 'Update default model'        },
+  { value: '/agents',    label: 'List available subagents'    },
+  { value: '/skills',    label: 'List available skills'       },
+  { value: '/memory',    label: 'Show saved memories'         },
+  { value: '/ralph',     label: 'Run ralph persistence loop'  },
+  { value: '/setup',     label: 'Configure provider API key + set default' },
+  { value: '/auth',      label: 'Show provider auth status'   },
+  { value: '/todos',     label: 'Show current todos'          },
+  { value: '/usage',     label: 'Show token usage'            },
+  { value: '/help',      label: 'Show help'                   },
+  { value: '/quit',      label: 'Exit'                        },
 ];
 
 // ---------------------------------------------------------------------------
@@ -81,6 +86,76 @@ function genId(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown Parser
+// ---------------------------------------------------------------------------
+
+function renderInline(t: Token, idx: number): React.ReactNode {
+  if (t.type === 'strong') return <Text key={idx} bold>{(t as any).tokens ? (t as any).tokens.map((c: any, i: number) => renderInline(c, i)) : t.text}</Text>;
+  if (t.type === 'em') return <Text key={idx} italic>{(t as any).tokens ? (t as any).tokens.map((c: any, i: number) => renderInline(c, i)) : t.text}</Text>;
+  if (t.type === 'codespan') return <Text key={idx} color="yellow" backgroundColor="gray"> {t.text} </Text>;
+  if (t.type === 'text') return <Text key={idx}>{t.text}</Text>;
+  if (t.type === 'escape') return <Text key={idx}>{t.text}</Text>;
+  if (t.type === 'br') return <Text key={idx}>{'\n'}</Text>;
+  if (t.type === 'link') return <Text key={idx} color="blue" underline>{t.text}</Text>;
+  if ((t as any).tokens) return <Text key={idx}>{(t as any).tokens.map((child: Token, i: number) => renderInline(child, i))}</Text>;
+  return <Text key={idx}>{t.raw}</Text>;
+}
+
+const Markdown: React.FC<{ children: string }> = ({ children }) => {
+  if (!children) return null;
+  const tokens = marked.lexer(children);
+
+  return (
+    <Box flexDirection="column">
+      {tokens.map((t, i) => {
+        if (t.type === 'paragraph') {
+          return (
+            <Box key={i} marginBottom={1}>
+              <Text>{t.tokens ? t.tokens.map((child: any, j: number) => renderInline(child, j)) : t.text}</Text>
+            </Box>
+          );
+        }
+        if (t.type === 'code') {
+          return (
+            <Box key={i} borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
+              <Text color="cyan">{t.text}</Text>
+            </Box>
+          );
+        }
+        if (t.type === 'list') {
+          return (
+            <Box key={i} flexDirection="column" marginBottom={1}>
+              {(t as any).items.map((item: any, j: number) => (
+                <Box key={j} paddingLeft={2}>
+                  <Text dimColor>• </Text>
+                  <Text>{item.tokens ? item.tokens.map((child: any, k: number) => renderInline(child, k)) : item.text}</Text>
+                </Box>
+              ))}
+            </Box>
+          );
+        }
+        if (t.type === 'heading') {
+          return (
+            <Box key={i} marginBottom={1}>
+              <Text bold color="magenta">{t.text}</Text>
+            </Box>
+          );
+        }
+        if (t.type === 'blockquote') {
+          return (
+             <Box key={i} paddingLeft={2} marginBottom={1}>
+                {t.tokens ? t.tokens.map((child: any, j: number) => renderInline(child, j)) : <Text>{t.text}</Text>}
+             </Box>
+          );
+        }
+        if (t.type === 'space') return null;
+        return <Box key={i}><Text>{t.raw}</Text></Box>;
+      })}
+    </Box>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
 
@@ -107,7 +182,7 @@ const UserMsg: React.FC<{ msg: Message }> = ({ msg }) => (
       <Text bold color="white">You</Text>
     </Box>
     <Box paddingLeft={3}>
-      <Text>{msg.content}</Text>
+      <Markdown>{msg.content}</Markdown>
     </Box>
   </Box>
 );
@@ -125,7 +200,7 @@ const AssistantMsg: React.FC<{ msg: Message }> = ({ msg }) => (
     </Box>
     {msg.content && (
       <Box paddingLeft={2}>
-        <Text>{msg.content}</Text>
+        <Markdown>{msg.content}</Markdown>
       </Box>
     )}
   </Box>
@@ -203,6 +278,9 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
   type SetupStep = 'idle' | 'select-provider' | 'enter-key' | 'set-default';
   interface SetupState { step: SetupStep; selectedProvider: string; enteredKey: string; }
   const [setupState, setSetupState] = useState<SetupState>({ step: 'idle', selectedProvider: '', enteredKey: '' });
+
+  type ProviderCmdStep = 'idle' | 'select-provider' | 'select-model';
+  const [providerCmdState, setProviderCmdState] = useState<{ step: ProviderCmdStep; chosenProvider: string; actionCmd: '/provider' | '/model' }>({ step: 'idle', chosenProvider: '', actionCmd: '/provider' });
 
   // Stable refs — safe to read inside async callbacks
   const orchestratorRef = useRef(new AgentOrchestrator(options.workdir));
@@ -385,6 +463,39 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
       return;
     }
 
+    if (trimmed === '/provider') {
+      const providerList = Object.keys(SUPPORTED_PROVIDERS);
+      setProviderCmdState({ step: 'select-provider', chosenProvider: '', actionCmd: '/provider' });
+      setCompletedMessages((prev) => [...prev, {
+        id: genId(), role: 'system',
+        content: [
+          'Select new default provider:',
+          ...providerList.map((p, i) => `  ${i + 1}. ${p}`),
+          '',
+          'Enter provider name or number:',
+        ].join('\n'),
+        toolCalls: [],
+      }]);
+      return;
+    }
+
+    if (trimmed === '/model') {
+      const p = options.provider;
+      const models = SUPPORTED_PROVIDERS[p]?.models || [];
+      setProviderCmdState({ step: 'select-model', chosenProvider: p, actionCmd: '/model' });
+      setCompletedMessages((prev) => [...prev, {
+        id: genId(), role: 'system',
+        content: [
+          `Select new default model for ${p}:`,
+          ...models.map((m, i) => `  ${i + 1}. ${m}`),
+          '',
+          'Enter model name or number:',
+        ].join('\n'),
+        toolCalls: [],
+      }]);
+      return;
+    }
+
     if (trimmed === '/setup') {
       const providerList = ['anthropic', 'openai', 'google', 'xai'];
       setSetupState({ step: 'select-provider', selectedProvider: '', enteredKey: '' });
@@ -561,7 +672,52 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
     setPickerFilter('');
     setPickerIndex(0);
 
-    // Wizard interception
+    // Provider/Model Wizard interception
+    if (providerCmdState.step !== 'idle') {
+      const trimmedVal = value.trim();
+      
+      if (providerCmdState.step === 'select-provider') {
+        const providerList = Object.keys(SUPPORTED_PROVIDERS);
+        const idx = parseInt(trimmedVal, 10);
+        const provider = isNaN(idx) ? trimmedVal.toLowerCase() : providerList[idx - 1];
+        
+        if (!provider || !providerList.includes(provider)) {
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `Unknown provider: ${trimmedVal}. Try again:`, toolCalls: [] }]);
+          return;
+        }
+        
+        setDefaultProvider(provider).then(() => {
+          const models = SUPPORTED_PROVIDERS[provider]?.models || [];
+          setProviderCmdState({ step: 'select-model', chosenProvider: provider, actionCmd: '/provider' });
+          setCompletedMessages((prev) => [...prev, { 
+            id: genId(), role: 'system', 
+            content: `✓ Default provider set to ${provider}.\n\nSelect new default model:\n${models.map((m: string, i: number) => `  ${i + 1}. ${m}`).join('\n')}\n\nEnter model name or number:`, 
+            toolCalls: [] 
+          }]);
+        });
+        return;
+      }
+      
+      if (providerCmdState.step === 'select-model') {
+        const p = providerCmdState.chosenProvider;
+        const models = SUPPORTED_PROVIDERS[p]?.models || [];
+        const mIdx = parseInt(trimmedVal, 10);
+        const chosenModel = isNaN(mIdx) ? trimmedVal : models[mIdx - 1];
+
+        if (!chosenModel || !models.includes(chosenModel)) {
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `Unknown model: ${trimmedVal}. Try again:`, toolCalls: [] }]);
+          return;
+        }
+
+        setDefaultModel(chosenModel).then(() => {
+          setProviderCmdState({ step: 'idle', chosenProvider: '', actionCmd: '/model' });
+          setCompletedMessages((prev) => [...prev, { id: genId(), role: 'system', content: `✓ Default model set to ${chosenModel}.\n(Restart the agent or run /new to apply changes to active session state!)`, toolCalls: [] }]);
+        });
+        return;
+      }
+    }
+
+    // Setup Wizard interception
     if (setupState.step !== 'idle') {
       const trimmedVal = value.trim();
       const providerList = ['anthropic', 'openai', 'google', 'xai'];
@@ -677,7 +833,7 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
           </Box>
           {streamingContent !== '' && (
             <Box paddingLeft={2}>
-              <Text>{streamingContent}</Text>
+              <Markdown>{streamingContent}</Markdown>
             </Box>
           )}
         </Box>

@@ -32,8 +32,8 @@ export const SUPPORTED_PROVIDERS: Record<string, ProviderConfig> = {
     defaultModel: 'gemini-2.0-flash',
   },
   xai: {
-    models: ['grok-2', 'grok-2-mini'],
-    defaultModel: 'grok-2',
+    models: ['grok-3', 'grok-3-mini', 'grok-4-1-fast-reasoning', 'grok-4-1-fast-non-reasoning', 'grok-4.20-reasoning', 'grok-4.20-non-reasoning'],
+    defaultModel: 'grok-4-1-fast-reasoning',
   },
 };
 
