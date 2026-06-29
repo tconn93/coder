@@ -34,6 +34,7 @@ export type StreamEventType =
   | 'todo_update'
   | 'token_usage'
   | 'subagent'
+  | 'status'
   | 'done'
   | 'error';
 
