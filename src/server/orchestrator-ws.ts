@@ -99,18 +99,17 @@ function emitOrchestratorEvent(type: string, payload: Record<string, unknown>): 
   });
 }
 
-/**
- * Bridge agent2.0's internal StreamEvent types to the orchestrator's
- * expected event protocol.
- */
+// Persistent ID across a thought stream so deltas accumulate in the UI
+let currentThoughtId = '';
+
 function bridgeStreamEvent(event: StreamEvent): void {
   switch (event.type) {
     case 'text': {
-      // Streaming text deltas → agent:thought
+      if (!currentThoughtId) currentThoughtId = `th-${Date.now()}`;
       emitOrchestratorEvent('agent:thought', {
         chunk: event.data as string,
         isDelta: true,
-        thoughtId: `th-${Date.now()}`,
+        thoughtId: currentThoughtId,
         category: 'reasoning',
       });
       break;
@@ -165,6 +164,7 @@ function bridgeStreamEvent(event: StreamEvent): void {
     }
 
     case 'done': {
+      currentThoughtId = '';
       const done = event.data as { result: string; tokenUsage: unknown };
       emitOrchestratorEvent('agent:done', {
         outcome: 'completed',
@@ -183,6 +183,7 @@ function bridgeStreamEvent(event: StreamEvent): void {
     }
 
     case 'error': {
+      currentThoughtId = '';
       const err = event.data as { message: string; code?: string };
       emitOrchestratorEvent('agent:done', {
         outcome: 'error',
@@ -344,111 +345,78 @@ function scheduleReconnect(): void {
 }
 
 /**
+ * Connect to the orchestrator WebSocket. Returns a promise that resolves once
+ * the first connection is established (or rejects after 15s timeout).
+ */
+export function connectToOrchestratorAsync(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!MAIN_WS) { console.log('[orch-ws] MAIN_WS_URL not set'); resolve(); return; }
+    if (!AGENT_TOKEN) { console.log('[orch-ws] AGENT_TOKEN not set'); resolve(); return; }
+
+    const timeout = setTimeout(() => reject(new Error('Orch WS connect timeout')), 15_000);
+
+    socket = ioClient(MAIN_WS, {
+      path: '/ws',
+      transports: ['websocket'],
+      auth: { token: AGENT_TOKEN },
+      query: { role: 'agent', agentId: AGENT_ID, sessionId: SESSION_ID, deploymentId: DEPLOYMENT_ID },
+      extraHeaders: {
+        'X-Agent-Token': AGENT_TOKEN,
+        'X-Agent-Id': AGENT_ID,
+        'X-Agent-Rest-Url': AGENT_REST_URL,
+        'X-Agent-Type': AGENT_TYPE,
+      },
+      reconnection: false,
+    });
+
+    socket.on('connect', () => {
+      clearTimeout(timeout);
+      console.log('[orch-ws] Connected to orchestrator');
+      reconnectAttempts = 0;
+      emitOrchestratorEvent('agent:status', { state: 'idle', uptimeSeconds: Math.floor(process.uptime()), claudeActive: false, queueDepth: 0 });
+      emitOrchestratorEvent('agent:log', { stream: 'system', lines: [`Agent ${AGENT_ID} connected (type: ${AGENT_TYPE})`], source: 'system' });
+      resolve();
+    });
+
+    socket.on('connect_error', (err: Error) => { console.error(`[orch-ws] Connection error: ${err.message}`); });
+
+    // Wire the inbound command handlers
+    setupOrchestratorHandlers();
+  });
+}
+
+/**
  * Connect to the orchestrator WebSocket. Keeps retrying on failure.
  */
 export function connectToOrchestrator(): void {
-  if (!MAIN_WS) {
-    console.log('[orch-ws] MAIN_WS_URL not set — skipping orchestrator connection');
-    return;
-  }
-  if (!AGENT_TOKEN) {
-    console.log('[orch-ws] AGENT_TOKEN not set — cannot authenticate with orchestrator');
-    return;
-  }
+  connectToOrchestratorAsync().catch(() => scheduleReconnect());
+}
 
-  console.log(`[orch-ws] Connecting to orchestrator: ${MAIN_WS}`);
-
-  socket = ioClient(MAIN_WS, {
-    path: '/ws',
-    transports: ['websocket'],
-    auth: { token: AGENT_TOKEN },
-    query: {
-      role: 'agent',
-      agentId: AGENT_ID,
-      sessionId: SESSION_ID,
-      deploymentId: DEPLOYMENT_ID,
-    },
-    extraHeaders: {
-      'X-Agent-Token': AGENT_TOKEN,
-      'X-Agent-Id': AGENT_ID,
-      'X-Agent-Rest-Url': AGENT_REST_URL,
-      'X-Agent-Type': AGENT_TYPE,
-    },
-    reconnection: false, // We handle reconnection ourselves
-  });
-
-  socket.on('connect', () => {
-    console.log('[orch-ws] Connected to orchestrator');
-    reconnectAttempts = 0;
-
-    // Announce readiness — send status so orchestrator knows we're alive
-    emitOrchestratorEvent('agent:status', {
-      state: 'idle',
-      uptimeSeconds: Math.floor(process.uptime()),
-      claudeActive: false,
-      queueDepth: 0,
-    });
-
-    // Also send agent:log so UI sees the agent came online
-    emitOrchestratorEvent('agent:log', {
-      stream: 'system',
-      lines: [`Agent ${AGENT_ID} connected (type: ${AGENT_TYPE}, model: ${AGENT_MODEL})`],
-      source: 'system',
-    });
-  });
+function setupOrchestratorHandlers(): void {
+  if (!socket) return;
 
   // ── Inbound orchestrator commands ──
   socket.on('command:start', (data: Record<string, unknown>) => {
     void handleCommandStart(data);
   });
-
   socket.on('command:intervene', (data: Record<string, unknown>) => {
     void handleCommandIntervene(data);
   });
-
-  socket.on('command:stop', () => {
-    handleCommandStop();
-  });
-
-  socket.on('command:pause', () => {
-    handleCommandPause();
-  });
-
-  socket.on('command:resume', () => {
-    handleCommandResume();
-  });
-
-  socket.on('command:push_branch', () => {
-    void handleCommandPushBranch();
-  });
-
-  // Also accept the command format used by the frontend:
-  // { type: "command:intervene", payload: { message } }
+  socket.on('command:stop', () => handleCommandStop());
+  socket.on('command:pause', () => handleCommandPause());
+  socket.on('command:resume', () => handleCommandResume());
+  socket.on('command:push_branch', () => { void handleCommandPushBranch(); });
   socket.on('agent:command', (data: Record<string, unknown>) => {
-    const cmdType = (data.type as string) || '';
-    if (cmdType === 'intervene') {
-      void handleCommandIntervene(data);
-    }
+    if ((data.type as string) === 'intervene') void handleCommandIntervene(data);
   });
 
-  // ── Disconnect ──
+  // ── Disconnect / reconnect ──
   socket.on('disconnect', (reason: string) => {
     console.log(`[orch-ws] Disconnected: ${reason}`);
-    if (!isShuttingDown) {
-      scheduleReconnect();
-    }
-  });
-
-  socket.on('connect_error', (err: Error) => {
-    console.error(`[orch-ws] Connection error: ${err.message}`);
-    // Socket.io will auto-retry unless we stop it — our manual reconnection
-    // kicks in on 'disconnect'. Don't double-schedule.
+    if (!isShuttingDown) scheduleReconnect();
   });
 }
 
-/**
- * Send a message to the orchestrator. Public for use by other modules.
- */
 export function sendToOrchestrator(type: string, payload: Record<string, unknown>): void {
   emitOrchestratorEvent(type, payload);
 }

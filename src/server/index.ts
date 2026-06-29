@@ -5,7 +5,7 @@ import { readFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import v1Router from './v1.js';
-import { connectToOrchestrator, disconnectFromOrchestrator } from './orchestrator-ws.js';
+import { connectToOrchestrator, connectToOrchestratorAsync, disconnectFromOrchestrator } from './orchestrator-ws.js';
 import {
   setDefaultWorkdir,
   authMiddleware,
@@ -161,11 +161,21 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
     console.log(`  Orchestrator API: http://0.0.0.0:${agentApiPort}/api/v1`);
   }
 
-  // Auto-start mode: if AUTO_START=1 and TASK is set, first discover the
-  // dev server command using the LLM, then submit the user's task.
+  // Connect to orchestrator WebSocket FIRST — must be established before
+  // auto-start so the Orch API receives thought/log/status events.
+  if (process.env.MAIN_WS_URL) {
+    try {
+      await connectToOrchestratorAsync();
+    } catch (err) {
+      console.error('[server] Failed to connect to orchestrator:', err);
+    }
+  }
+
+  // Auto-start mode: if AUTO_START=1 and TASK is set, discover the dev server
+  // command using the LLM, then submit the user's task.
   if (process.env.AUTO_START === '1' && process.env.TASK) {
     const workdir = process.env.CODER_WORKDIR || '/workspace';
-    const provider = process.env.DEFAULT_PROVIDER || 'anthropic'; // 'anthropic' only as CLI fallback — node always sets DEFAULT_PROVIDER
+    const provider = process.env.DEFAULT_PROVIDER || 'anthropic';
     const model = process.env.AGENT_MODEL || process.env.DEFAULT_MODEL || '';
 
     console.log(`[server] Auto-starting agent for: ${process.env.TASK.slice(0, 100)}`);
@@ -176,7 +186,6 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
       const discovered = await discoverDevCommand(workdir, provider, model);
       console.log(`[server] Dev command (${discovered.source}): ${discovered.command}`);
       startDevServer(workdir, discovered.command);
-      // Give the dev server a moment to start binding ports
       await new Promise((r) => setTimeout(r, 3000));
     } catch (err) {
       console.error('[server] Repo setup failed (non-fatal):', err);
@@ -201,11 +210,6 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
       },
     } as any;
     await handleChat(synthReq, synthRes);
-  }
-
-  // Connect back to orchestrator WebSocket (Docker/cloud mode)
-  if (process.env.MAIN_WS_URL) {
-    connectToOrchestrator();
   }
 
   const authStatus = process.env.CODER_API_KEY ? '🔒 authenticated' : '⚠️  open (no CODER_API_KEY set)';
