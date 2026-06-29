@@ -228,4 +228,160 @@ setInterval(() => {
   }
 }, 60_000);
 
+// ---------------------------------------------------------------------------
+// Agent lifecycle routes (proxied by orchestrator)
+// ---------------------------------------------------------------------------
+
+import {
+  startOrchestratorSession,
+  interveneOrchestratorSession,
+  cancelOrchestratorSession,
+  getOrchestratorSessionState,
+  type OrchestratorEventSink,
+} from './api.js';
+import type { AgentOptions, StreamEvent } from '../types.js';
+
+/** Build options from env, same as api.ts buildOptions. */
+function buildV1AgentOptions(overrides?: Partial<AgentOptions>): AgentOptions {
+  return {
+    provider: overrides?.provider || process.env.DEFAULT_PROVIDER || 'anthropic',
+    model: overrides?.model || process.env.DEFAULT_MODEL || (process.env.AGENT_MODEL || 'claude-sonnet-4-6'),
+    maxTurns: overrides?.maxTurns || parseInt(process.env.CODER_MAX_TURNS || '50', 10),
+    budget: overrides?.budget || parseFloat(process.env.CODER_BUDGET || '10.00'),
+    permissionMode:
+      overrides?.permissionMode ||
+      (process.env.CODER_PERMISSION_MODE as AgentOptions['permissionMode']) ||
+      'acceptEdits',
+    workdir: overrides?.workdir || process.env.CODER_WORKDIR || process.env.WORKSPACE_DIR || '/workspace',
+    verbose: overrides?.verbose || false,
+  };
+}
+
+/** Send stream events back to orchestrator WebSocket if connected. */
+function makeOrchEventSink(): OrchestratorEventSink {
+  return (event: StreamEvent) => {
+    try {
+      // Dynamic import to avoid circular dependency at module load time
+      import('./orchestrator-ws.js').then(({ sendToOrchestrator }) => {
+        switch (event.type) {
+          case 'text':
+            sendToOrchestrator('agent:thought', { chunk: event.data as string, isDelta: true, thoughtId: `th-${Date.now()}` });
+            break;
+          case 'tool_call': {
+            const tc = event.data as { name: string; input: unknown };
+            sendToOrchestrator('agent:log', { stream: 'stdout', lines: [`[${tc.name}] ${JSON.stringify(tc.input).slice(0, 200)}`] });
+            break;
+          }
+          case 'done': {
+            const d = event.data as { result: string };
+            sendToOrchestrator('agent:done', { outcome: 'completed', summary: d.result?.slice(0, 500) || 'Done' });
+            break;
+          }
+          case 'error': {
+            const e = event.data as { message: string };
+            sendToOrchestrator('agent:done', { outcome: 'error', summary: e.message });
+            break;
+          }
+        }
+      }).catch(() => { /* orchestrator-ws not available */ });
+    } catch { /* ignore */ }
+  };
+}
+
+const sessionId = process.env.SESSION_ID || '';
+
+/** POST /api/v1/agent/start — start an agent session */
+router.post('/agent/start', async (req: Request, res: Response) => {
+  try {
+    const { task } = req.body as { task?: { description: string } | string };
+    const taskDesc = typeof task === 'string' ? task : task?.description || '';
+
+    if (!taskDesc) {
+      res.status(400).json({ success: false, error: 'task is required' });
+      return;
+    }
+
+    const options = buildV1AgentOptions();
+    res.status(202).json({ sessionId, agentState: 'starting' });
+
+    // Run asynchronously so the response returns immediately
+    await startOrchestratorSession(sessionId, taskDesc, options, makeOrchEventSink());
+  } catch (err) {
+    res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+/** POST /api/v1/agent/stop — stop the agent */
+router.post('/agent/stop', async (_req: Request, res: Response) => {
+  cancelOrchestratorSession(sessionId);
+  res.json({ sessionId, agentState: 'stopped' });
+});
+
+/** POST /api/v1/agent/intervene — send a message to the running agent */
+router.post('/agent/intervene', async (req: Request, res: Response) => {
+  try {
+    const { message } = req.body as { message?: string };
+    if (!message) {
+      res.status(400).json({ success: false, error: 'message is required' });
+      return;
+    }
+
+    res.json({ interventionId: 'int-' + Date.now(), accepted: true });
+
+    const options = buildV1AgentOptions();
+    await interveneOrchestratorSession(sessionId, message, options, makeOrchEventSink());
+  } catch (err) {
+    res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+/** POST /api/v1/agent/pause — pause the agent */
+router.post('/agent/pause', async (_req: Request, res: Response) => {
+  cancelOrchestratorSession(sessionId);
+  res.json({ sessionId, agentState: 'paused' });
+});
+
+/** POST /api/v1/agent/resume — resume the agent */
+router.post('/agent/resume', async (_req: Request, res: Response) => {
+  res.json({ sessionId, agentState: 'running' });
+});
+
+/** POST /api/v1/git/status — return git status */
+router.post('/git/status', async (_req: Request, res: Response) => {
+  try {
+    const workspace = process.env.CODER_WORKDIR || process.env.WORKSPACE_DIR || '/workspace';
+    const { stdout } = await execAsync('git status --short', { cwd: workspace });
+    const { stdout: branchOut } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: workspace });
+    const branch = branchOut.trim();
+    const dirty = stdout.trim().length > 0;
+    const files = stdout.trim().split('\n').filter(Boolean).map((line) => {
+      const statusCode = line.slice(0, 2).trim();
+      const filename = line.slice(3).trim();
+      return { status: statusCode, file: filename };
+    });
+    res.json({
+      branch: branch || 'unknown',
+      state: dirty ? 'dirty' : 'clean',
+      changes: files,
+    });
+  } catch (err) {
+    res.json({ branch: 'main', state: 'unknown', error: (err as Error).message });
+  }
+});
+
+/** POST /api/v1/git/commit — stage all changes and commit */
+router.post('/git/commit', async (req: Request, res: Response) => {
+  try {
+    const { message = 'chore: apply changes from agent' } = req.body as { message?: string };
+    const workspace = process.env.CODER_WORKDIR || process.env.WORKSPACE_DIR || '/workspace';
+    await execAsync('git add -A', { cwd: workspace });
+    const { stdout } = await execAsync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: workspace });
+    const commitMatch = stdout.match(/\[[\w-]+ ([a-f0-9]+)\]/);
+    const hash = commitMatch ? commitMatch[1] : 'unknown';
+    res.status(201).json({ hash, message, filesChanged: 1 });
+  } catch (err) {
+    res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
 export default router;

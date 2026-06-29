@@ -3,7 +3,7 @@ import { Box, Text, Static, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { join } from 'path';
 import { readFile } from 'fs/promises';
-import type { AgentOptions, StreamEvent, TokenUsage, TodoItem } from '../types.js';
+import type { AgentOptions, StreamEvent, TokenUsage, TodoItem, PermissionMode } from '../types.js';
 import { AgentOrchestrator } from '../agent/index.js';
 import { AgentLoader } from '../agent/agentLoader.js';
 import { BUILTIN_AGENTS } from '../agent/tools.js';
@@ -23,19 +23,20 @@ const APP_NAME = "Tyler's AI Company's Coder";
 interface SlashCommand { value: string; label: string; }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-  { value: '/new',       label: 'Start a fresh conversation'  },
-  { value: '/provider',  label: 'Update default provider & model' },
-  { value: '/model',     label: 'Update default model'        },
-  { value: '/agents',    label: 'List available subagents'    },
-  { value: '/skills',    label: 'List available skills'       },
-  { value: '/memory',    label: 'Show saved memories'         },
-  { value: '/ralph',     label: 'Run ralph persistence loop'  },
-  { value: '/setup',     label: 'Configure provider API key + set default' },
-  { value: '/auth',      label: 'Show provider auth status'   },
-  { value: '/todos',     label: 'Show current todos'          },
-  { value: '/usage',     label: 'Show token usage'            },
-  { value: '/help',      label: 'Show help'                   },
-  { value: '/quit',      label: 'Exit'                        },
+  { value: '/new',        label: 'Start a fresh conversation'  },
+  { value: '/provider',   label: 'Update default provider & model' },
+  { value: '/model',      label: 'Update default model'        },
+  { value: '/permission', label: 'Show or set permission mode' },
+  { value: '/agents',     label: 'List available subagents'    },
+  { value: '/skills',     label: 'List available skills'       },
+  { value: '/memory',     label: 'Show saved memories'         },
+  { value: '/ralph',      label: 'Run ralph persistence loop'  },
+  { value: '/setup',      label: 'Configure provider API key + set default' },
+  { value: '/auth',       label: 'Show provider auth status'   },
+  { value: '/todos',      label: 'Show current todos'          },
+  { value: '/usage',      label: 'Show token usage'            },
+  { value: '/help',       label: 'Show help'                   },
+  { value: '/quit',       label: 'Exit'                        },
 ];
 
 // ---------------------------------------------------------------------------
@@ -283,10 +284,11 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
   const [providerCmdState, setProviderCmdState] = useState<{ step: ProviderCmdStep; chosenProvider: string; actionCmd: '/provider' | '/model' }>({ step: 'idle', chosenProvider: '', actionCmd: '/provider' });
 
   // Stable refs — safe to read inside async callbacks
-  const orchestratorRef = useRef(new AgentOrchestrator(options.workdir));
-  const sessionIdRef    = useRef<string | null>(null);
-  const queue           = useRef(new AsyncQueue<string>());
-  const usageRef        = useRef({ tokens: 0, cost: 0 });
+  const orchestratorRef   = useRef(new AgentOrchestrator(options.workdir));
+  const sessionIdRef      = useRef<string | null>(null);
+  const queue             = useRef(new AsyncQueue<string>());
+  const usageRef          = useRef({ tokens: 0, cost: 0 });
+  const permissionModeRef = useRef<PermissionMode>(options.permissionMode ?? 'acceptEdits');
 
   useEffect(() => {
     usageRef.current = { tokens: totalTokens, cost: totalCost };
@@ -309,10 +311,11 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
     let text = '';
     const tools: string[] = [];
 
+    const effectiveOptions = { ...options, permissionMode: permissionModeRef.current };
     const events = (
       sessionIdRef.current
-        ? orchestratorRef.current.resume(sessionIdRef.current, userInput, options)
-        : orchestratorRef.current.run(userInput, options)
+        ? orchestratorRef.current.resume(sessionIdRef.current, userInput, effectiveOptions)
+        : orchestratorRef.current.run(userInput, effectiveOptions)
     ) as AsyncGenerator<StreamEvent>;
 
     try {
@@ -589,7 +592,7 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
         let text = '';
         const tools: string[] = [];
         try {
-          for await (const event of runRalph({ prompt: ralphPrompt, agentOptions: options })) {
+          for await (const event of runRalph({ prompt: ralphPrompt, agentOptions: { ...options, permissionMode: permissionModeRef.current } })) {
             switch (event.type) {
               case 'text':
                 text += event.data as string;
@@ -632,20 +635,63 @@ export const App: React.FC<{ options: AgentOptions }> = ({ options }) => {
       return;
     }
 
+    if (trimmed.startsWith('/permission')) {
+      const MODES: PermissionMode[] = ['bypassPermissions', 'acceptEdits', 'default', 'plan'];
+      const arg = trimmed.slice('/permission'.length).trim() as PermissionMode | '';
+
+      if (!arg) {
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system',
+          content: [
+            `Current permission mode: ${permissionModeRef.current}`,
+            '',
+            'Available modes:',
+            '  bypassPermissions — all tools unrestricted',
+            '  acceptEdits       — file edits allowed, bash blocked (default)',
+            '  default           — all destructive tools blocked',
+            '  plan              — all destructive tools blocked',
+            '',
+            'Usage: /permission <mode>',
+          ].join('\n'),
+          toolCalls: [],
+        }]);
+        return;
+      }
+
+      if (!MODES.includes(arg)) {
+        setCompletedMessages((prev) => [...prev, {
+          id: genId(), role: 'system',
+          content: `Unknown permission mode: ${arg}. Valid modes: ${MODES.join(', ')}`,
+          toolCalls: [],
+        }]);
+        return;
+      }
+
+      permissionModeRef.current = arg;
+      setCompletedMessages((prev) => [...prev, {
+        id: genId(), role: 'system',
+        content: `Permission mode set to: ${arg}`,
+        toolCalls: [],
+      }]);
+      return;
+    }
+
     if (trimmed === '/help') {
       setCompletedMessages((prev) => [...prev, {
         id: genId(), role: 'system',
         content: [
-          '/new          — start a fresh conversation',
-          '/agents       — list available subagents',
-          '/skills       — list available skills',
-          '/memory       — show saved memories',
-          '/ralph <prompt> — run ralph persistence loop',
-          '/setup        — configure provider API key + set default',
-          '/auth         — show provider auth status',
-          '/todos        — show current todos',
-          '/usage        — show token usage',
-          '/quit         — exit',
+          '/new                     — start a fresh conversation',
+          '/permission [mode]       — show or set permission mode',
+          '                           modes: bypassPermissions | acceptEdits | default | plan',
+          '/agents                  — list available subagents',
+          '/skills                  — list available skills',
+          '/memory                  — show saved memories',
+          '/ralph <prompt>          — run ralph persistence loop',
+          '/setup                   — configure provider API key + set default',
+          '/auth                    — show provider auth status',
+          '/todos                   — show current todos',
+          '/usage                   — show token usage',
+          '/quit                    — exit',
           '',
           "To add API keys: run 'coder auth' in your terminal.",
           'Tip: type / to browse commands with ↑↓ arrow keys, Enter to select.',

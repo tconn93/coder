@@ -401,3 +401,156 @@ export function attachWebSocket(ws: WebSocket, sessionId: string): void {
   ws.on('close', () => s.wsClients.delete(ws));
   ws.on('error', () => s.wsClients.delete(ws));
 }
+
+// ---------------------------------------------------------------------------
+// Orchestrator session management (used by orchestrator-ws.ts and v1.ts)
+// ---------------------------------------------------------------------------
+
+/** Event callback type for orchestrator bridges. */
+export type OrchestratorEventSink = (event: StreamEvent) => void;
+
+/**
+ * Start an agent session keyed by the orchestrator's session ID.
+ * Events are delivered to `onEvent` instead of the internal broadcast mechanism.
+ */
+export async function startOrchestratorSession(
+  orchSessionId: string,
+  prompt: string,
+  options: AgentOptions,
+  onEvent: OrchestratorEventSink,
+): Promise<void> {
+  // Cancel any existing session with this orchestrator ID
+  const existing = sessions.get(orchSessionId);
+  if (existing) {
+    existing.isRunning = false;
+    existing.abortController?.abort();
+    sessions.delete(orchSessionId);
+  }
+
+  const orchestrator = new AgentOrchestrator(options.workdir);
+  const abortController = new AbortController();
+
+  const state: SessionState = {
+    sessionId: orchSessionId,
+    orchestrator,
+    events: [],
+    sseClients: new Set(),
+    wsClients: new Set(),
+    isRunning: true,
+    startedAt: new Date().toISOString(),
+    prompt,
+    abortController,
+  };
+  sessions.set(orchSessionId, state);
+
+  try {
+    for await (const event of orchestrator.run(prompt, options)) {
+      // Mirror to internal broadcast AND the orchestrator sink
+      broadcast(orchSessionId, event);
+      onEvent(event);
+
+      if (event.type === 'token_usage') {
+        state.tokenUsage = event.data as TokenUsage;
+      }
+
+      if (event.type === 'done' || event.type === 'error') {
+        state.isRunning = false;
+        break;
+      }
+    }
+  } catch (err) {
+    const errEvent: StreamEvent = {
+      type: 'error',
+      data: { message: (err as Error).message, code: 'AGENT_ERROR' },
+    };
+    broadcast(orchSessionId, errEvent);
+    onEvent(errEvent);
+  } finally {
+    state.isRunning = false;
+    setTimeout(() => sessions.delete(orchSessionId), 3_600_000);
+  }
+}
+
+/**
+ * Inject a user message into a running orchestrator session.
+ * Starts a new agent loop with the message if no session is running.
+ */
+export async function interveneOrchestratorSession(
+  orchSessionId: string,
+  message: string,
+  options: AgentOptions,
+  onEvent: OrchestratorEventSink,
+): Promise<void> {
+  const s = sessions.get(orchSessionId);
+
+  if (!s || !s.isRunning) {
+    // No running session — start a new one with this message
+    await startOrchestratorSession(orchSessionId, message, options, onEvent);
+    return;
+  }
+
+  // Session is running — we need to inject the message.
+  // The agent loop in loop.ts checks for pendingUserMessages, but that's
+  // internal to the AgentOrchestrator. Here we cancel the current run and
+  // resume with the message appended.
+  s.isRunning = false;
+  s.abortController?.abort();
+
+  // Wait a tick for the loop to unwind
+  await new Promise((r) => setTimeout(r, 100));
+
+  // Resume with the intervention
+  const newAbort = new AbortController();
+  s.abortController = newAbort;
+  s.isRunning = true;
+
+  try {
+    for await (const event of s.orchestrator.resume(orchSessionId, message, options)) {
+      broadcast(orchSessionId, event);
+      onEvent(event);
+
+      if (event.type === 'token_usage') {
+        s.tokenUsage = event.data as TokenUsage;
+      }
+
+      if (event.type === 'done' || event.type === 'error') {
+        s.isRunning = false;
+        break;
+      }
+    }
+  } catch (err) {
+    const errEvent: StreamEvent = {
+      type: 'error',
+      data: { message: (err as Error).message, code: 'AGENT_ERROR' },
+    };
+    broadcast(orchSessionId, errEvent);
+    onEvent(errEvent);
+  } finally {
+    s.isRunning = false;
+  }
+}
+
+/**
+ * Cancel a running orchestrator session.
+ */
+export function cancelOrchestratorSession(orchSessionId: string): boolean {
+  const s = sessions.get(orchSessionId);
+  if (!s || !s.isRunning) return false;
+
+  s.isRunning = false;
+  s.abortController?.abort();
+
+  broadcast(orchSessionId, {
+    type: 'error',
+    data: { message: 'Session cancelled by orchestrator', code: 'CANCELLED' },
+  });
+
+  return true;
+}
+
+/** Return the current running state for an orchestrator session. */
+export function getOrchestratorSessionState(orchSessionId: string): { isRunning: boolean } | null {
+  const s = sessions.get(orchSessionId);
+  if (!s) return null;
+  return { isRunning: s.isRunning };
+}
