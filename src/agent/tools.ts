@@ -10,11 +10,13 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fg from 'fast-glob';
 import { TodoTracker } from './todos.js';
-import { getProvider } from '../providers/index.js';
-import type { CustomAgentDef } from '../types.js';
+import { getProvider, resolveModelTier } from '../providers/index.js';
+import type { CustomAgentDef, PermissionMode } from '../types.js';
 import type { MemoryManager } from './memory.js';
 import type { NotepadManager } from './notepad.js';
 import { HandoffManager } from './handoffs.js';
+import { checkPermission } from './permissions.js';
+import { chromium } from 'playwright';
 
 const execAsync = promisify(exec);
 
@@ -26,6 +28,7 @@ interface SubagentDef {
   description: string;
   systemPrompt: string;
   tools: string[];
+  /** Model tier key ('opus' | 'sonnet' | 'haiku') resolved per-provider at runtime */
   model: string;
 }
 
@@ -43,7 +46,7 @@ When reviewing code:
 
 Be thorough, specific, and constructive. Always cite specific line numbers and file paths.`,
     tools: ['read_file', 'grep', 'glob'],
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
   },
   'test-runner': {
     description: 'Execute tests, analyze failures, improve coverage',
@@ -56,7 +59,7 @@ When working with tests:
 4. Check test coverage and identify gaps
 5. Suggest fixes for failing tests with specific code changes`,
     tools: ['bash', 'read_file', 'grep'],
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
   },
   'file-explorer': {
     description: 'Map codebase structure, find files, understand architecture',
@@ -69,7 +72,7 @@ When exploring:
 4. Find relevant files for specific functionality
 5. Summarize the architecture and patterns used`,
     tools: ['read_file', 'glob', 'grep'],
-    model: 'claude-haiku-4-5',
+    model: 'haiku',
   },
   'security-scanner': {
     description: 'Find vulnerabilities, secrets, injection risks',
@@ -84,7 +87,7 @@ When scanning:
 
 Report findings with severity levels (Critical/High/Medium/Low) and remediation steps.`,
     tools: ['read_file', 'grep', 'glob'],
-    model: 'claude-opus-4-6',
+    model: 'opus',
   },
   'doc-writer': {
     description: 'Write README, API docs, inline documentation',
@@ -97,55 +100,61 @@ When writing docs:
 4. Cover common use cases and edge cases
 5. Keep documentation accurate and up-to-date`,
     tools: ['read_file', 'write_file', 'glob', 'grep'],
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
   },
   executor: {
     description: 'Focused task executor — reads, writes, edits files and runs bash to implement changes',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
     tools: ['read_file', 'write_file', 'edit_file', 'bash', 'glob', 'grep', 'todo_write'],
     systemPrompt: `You are a focused executor agent. Your job is to implement tasks directly and efficiently. Read relevant files first, then make targeted changes. Run bash commands to verify your work. Mark todos as you complete steps. Be precise — do exactly what is asked, no more.`,
   },
   debugger: {
     description: 'Root-cause analysis — isolates bugs, analyzes stack traces, fixes regressions',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
     tools: ['read_file', 'edit_file', 'bash', 'glob', 'grep'],
     systemPrompt: `You are a debugging specialist. Analyze errors methodically: read the stack trace, find the root cause in code, identify the minimal fix. Check for regressions. Explain what caused the bug and what the fix does.`,
   },
   designer: {
     description: 'UI/UX implementation — builds React/HTML/CSS components with strong visual instincts',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
     tools: ['read_file', 'write_file', 'edit_file', 'bash', 'glob', 'grep'],
     systemPrompt: `You are a UI/UX designer-developer. Build visually polished, accessible components. Follow existing design patterns in the codebase. Prioritize user experience and clean code.`,
   },
   planner: {
     description: 'Strategic planning — analyzes requirements, produces actionable task breakdowns',
-    model: 'claude-opus-4-6',
+    model: 'opus',
     tools: ['read_file', 'glob', 'grep'],
     systemPrompt: `You are a strategic planning agent. Analyze the codebase and requirements thoroughly. Produce clear, actionable implementation plans with ordered steps, file-level specifics, and identified risks. Do not implement — only plan.`,
   },
   architect: {
     description: 'Architecture advisor — evaluates system design, identifies trade-offs',
-    model: 'claude-opus-4-6',
+    model: 'opus',
     tools: ['read_file', 'glob', 'grep'],
     systemPrompt: `You are a software architect. Evaluate designs for scalability, maintainability, and correctness. Identify architectural risks, propose alternatives, and verify that implementations match their intended design.`,
   },
   verifier: {
     description: 'Verification specialist — checks that work meets requirements, runs tests',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
     tools: ['read_file', 'bash', 'glob', 'grep'],
     systemPrompt: `You are a verification agent. Your job is to prove that work is complete and correct. Run tests, check outputs, verify file changes match requirements. Report pass/fail with evidence. Be skeptical — find gaps.`,
   },
   'test-engineer': {
     description: 'Test strategy and implementation — writes integration/e2e tests, fixes flaky tests',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
     tools: ['read_file', 'write_file', 'edit_file', 'bash', 'glob', 'grep'],
     systemPrompt: `You are a test engineering specialist. Write thorough tests that catch real bugs. Prefer integration tests over unit tests. Fix flaky tests by finding root causes. Ensure tests are readable and maintainable.`,
   },
   writer: {
     description: 'Technical documentation — writes README, API docs, inline comments',
-    model: 'claude-haiku-4-5',
+    model: 'haiku',
     tools: ['read_file', 'write_file', 'edit_file', 'glob', 'grep'],
     systemPrompt: `You are a technical writer. Produce clear, accurate documentation. Read the code before writing about it. Use examples. Write for developers who need to use or maintain this code.`,
+  },
+  'browser-qa': {
+    description: 'Visual QA and DOM inspection — opens pages, checks layout, validates text',
+    systemPrompt: `You are an expert QA Engineer. Use the browser_inspect tool to load the local development server (usually http://localhost:3000) and verify that the UI renders correctly. Check for missing elements, layout issues (from visible text context), and errors. Return a detailed bug report or confirmation of success.`,
+    tools: ['browser_inspect', 'bash', 'read_file'],
+    model: 'gpt-4o',
   },
 };
 
@@ -207,6 +216,7 @@ export function createBaseTools(
   memoryManager?: MemoryManager,
   notepadManager?: NotepadManager,
   handoffManager?: HandoffManager,
+  permissionMode: PermissionMode = 'acceptEdits',
 ) {
   return {
     read_file: tool({
@@ -241,6 +251,8 @@ export function createBaseTools(
         content: z.string().describe('Content to write'),
       }),
       execute: async (input) => {
+        const perm = checkPermission('write_file', permissionMode);
+        if (!perm.allowed) return `Blocked: ${perm.reason}`;
         const { path } = input;
         const content = normalizeEscapeSequences(decodeHtmlEntities(input.content));
         const filePath = resolve(workdir, path);
@@ -267,6 +279,8 @@ export function createBaseTools(
           .describe('Replace all occurrences (default: replace first only)'),
       }),
       execute: async (input) => {
+        const perm = checkPermission('edit_file', permissionMode);
+        if (!perm.allowed) return `Blocked: ${perm.reason}`;
         const { path, replace_all } = input;
         const old_string = normalizeEscapeSequences(decodeHtmlEntities(input.old_string));
         const new_string = normalizeEscapeSequences(decodeHtmlEntities(input.new_string));
@@ -299,6 +313,8 @@ export function createBaseTools(
           .describe('Timeout in milliseconds (default: 30000)'),
       }),
       execute: async (input) => {
+        const perm = checkPermission('bash', permissionMode);
+        if (!perm.allowed) return `Blocked: ${perm.reason}`;
         const { command, timeout = 30_000 } = input;
         try {
           const { stdout, stderr } = await execAsync(command, {
@@ -519,6 +535,28 @@ export function createBaseTools(
         return await handoffManager.readAll() || 'No handoffs found';
       },
     }),
+
+    browser_inspect: tool({
+      description: 'Navigates to a URL in a headless browser, evaluates the DOM, takes a screenshot (saved locally), and returns the visible text. Use to visually QA local development apps.',
+      inputSchema: z.object({
+        url: z.string().describe('URL to inspect (e.g. http://localhost:3000)'),
+      }),
+      execute: async (input) => {
+        try {
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+          await page.goto(input.url, { waitUntil: 'networkidle' });
+          const text = await page.evaluate(() => document.body.innerText);
+          const screenshotPath = resolve(workdir, '.coder', `screenshot-${Date.now()}.png`);
+          await fs.mkdir(dirname(screenshotPath), { recursive: true });
+          await page.screenshot({ path: screenshotPath });
+          await browser.close();
+          return `Browser successfully inspected ${input.url}.\nScreenshot saved to ${screenshotPath}.\n\nVisible Content:\n${text.slice(0, 5000)}`;
+        } catch (err) {
+          return `Browser inspection failed: ${(err as Error).message}`;
+        }
+      }
+    }),
   };
 }
 
@@ -534,8 +572,9 @@ export function createTools(
   memoryManager?: MemoryManager,
   notepadManager?: NotepadManager,
   handoffManager?: HandoffManager,
+  permissionMode: PermissionMode = 'acceptEdits',
 ) {
-  const base = createBaseTools(workdir, todoTracker, memoryManager, notepadManager, handoffManager);
+  const base = createBaseTools(workdir, todoTracker, memoryManager, notepadManager, handoffManager, permissionMode);
 
   // Merge built-in and custom agent definitions
   const allAgents: Record<string, SubagentDef> = { ...SUBAGENT_DEFS };
@@ -555,43 +594,115 @@ export function createTools(
     description: `Spawn a specialized subagent for a focused subtask. The subagent runs in isolation and returns its final answer.\n\nAvailable subagents:\n${agentList}`,
     inputSchema: z.object({
       name: z.string().describe(`Subagent name. Available: ${Object.keys(allAgents).join(', ')}`),
-      prompt: z
-        .string()
-        .describe(
-          'Detailed task description including relevant file paths and context',
-        ),
+      prompt: z.string().describe('Detailed task description including relevant file paths and context'),
+      verifyPrompt: z.string().optional().describe('Optional criteria for the subagent to internally verify via Ralph loop before returning'),
     }),
     execute: async (input) => {
-      const { name, prompt } = input;
+      const { name, prompt, verifyPrompt } = input;
       const def = allAgents[name];
       if (!def) return `Unknown subagent: ${name}. Available: ${Object.keys(allAgents).join(', ')}`;
 
       const subTodo = new TodoTracker();
-      const allBase = createBaseTools(workdir, subTodo);
-      // Build restricted tool set for subagent
+      const allBase = createBaseTools(workdir, subTodo, undefined, undefined, undefined, permissionMode);
       type BaseKey = keyof typeof allBase;
       const subTools = Object.fromEntries(
-        def.tools
-          .filter((t): t is BaseKey => t in allBase)
-          .map((t) => [t, allBase[t]]),
+        def.tools.filter((t): t is BaseKey => t in allBase).map((t) => [t, allBase[t]])
       ) as Partial<typeof allBase>;
 
       try {
-        const { text } = await generateText({
-          model: getProvider(provider, def.model),
-          system: def.systemPrompt,
-          messages: [{ role: 'user', content: prompt }],
-          tools: subTools,
-          stopWhen: stepCountIs(20),
-        });
-        return text || '(subagent produced no text output)';
+        let resultText = '';
+        const maxIters = verifyPrompt ? 3 : 1;
+        let lastVerdict = '';
+        for (let i = 0; i < maxIters; i++) {
+          const runPrompt = i === 0 ? prompt : `${prompt}\n\n[Verification Failed]\n${lastVerdict}\nPlease fix the issues and try again.`;
+          const { text } = await generateText({
+            model: getProvider(provider, resolveModelTier(provider, def.model)),
+            system: def.systemPrompt,
+            messages: [{ role: 'user', content: runPrompt }],
+            tools: subTools,
+            stopWhen: stepCountIs(20),
+          });
+          resultText = text || '';
+
+          if (!verifyPrompt) break;
+          const { text: verdict } = await generateText({
+            model: getProvider(provider, resolveModelTier(provider, 'haiku')), // fast verification model
+            system: `You are a verification agent. Assess whether a task was completed successfully. Respond with exactly one of:\n- "PASS: <reason>"\n- "FAIL: <reason>"`,
+            messages: [{ role: 'user', content: `Verification Criteria: ${verifyPrompt}\n\nAgent Output:\n${resultText}` }]
+          });
+          if (/^PASS/i.test(verdict.trim())) {
+            resultText += `\n\n[Internal Ralph Verdict: ${verdict.trim()}]`;
+            break;
+          }
+          lastVerdict = verdict;
+        }
+        return resultText || '(subagent produced no text output)';
       } catch (err) {
         return `Subagent error: ${(err as Error).message}`;
       }
     },
   });
 
-  return { ...base, spawn_subagent };
+  const spawn_swarm = tool({
+    description: `Spawn multiple specialized subagents concurrently for parallel task execution. Use this when a task can be broken into independent subtasks (e.g. frontend and backend). The swarm will run in parallel and return all their results combined.\n\nAvailable subagents:\n${agentList}`,
+    inputSchema: z.object({
+      tasks: z.array(z.object({
+        name: z.string().describe(`Subagent name. Available: ${Object.keys(allAgents).join(', ')}`),
+        prompt: z.string().describe('Detailed task description including relevant file paths and context for this specific subagent'),
+        verifyPrompt: z.string().optional().describe('Optional criteria for the subagent to internally verify via Ralph loop before returning'),
+      })).describe('Array of tasks to execute in parallel'),
+    }),
+    execute: async (input) => {
+      const results = await Promise.all(input.tasks.map(async (task) => {
+        const def = allAgents[task.name];
+        if (!def) return `[${task.name}]: Unknown subagent. Available: ${Object.keys(allAgents).join(', ')}`;
+
+        const subTodo = new TodoTracker();
+        const allBase = createBaseTools(workdir, subTodo, undefined, undefined, undefined, permissionMode);
+        type BaseKey = keyof typeof allBase;
+        const subTools = Object.fromEntries(
+          def.tools.filter((t): t is BaseKey => t in allBase).map((t) => [t, allBase[t]])
+        ) as Partial<typeof allBase>;
+
+        try {
+          let resultText = '';
+          const maxIters = task.verifyPrompt ? 3 : 1;
+          let lastVerdict = '';
+          
+          for (let i = 0; i < maxIters; i++) {
+            const runPrompt = i === 0 ? task.prompt : `${task.prompt}\n\n[Verification Failed]\n${lastVerdict}\nPlease fix the issues and try again.`;
+            const { text } = await generateText({
+              model: getProvider(provider, resolveModelTier(provider, def.model)),
+              system: def.systemPrompt,
+              messages: [{ role: 'user', content: runPrompt }],
+              tools: subTools,
+              stopWhen: stepCountIs(20),
+            });
+            resultText = text || '';
+
+            if (!task.verifyPrompt) break;
+            const { text: verdict } = await generateText({
+              model: getProvider(provider, resolveModelTier(provider, 'haiku')),
+              system: `You are a verification agent. Assess whether a task was completed successfully. Respond with exactly one of:\n- "PASS: <reason>"\n- "FAIL: <reason>"`,
+              messages: [{ role: 'user', content: `Verification Criteria: ${task.verifyPrompt}\n\nAgent Output:\n${resultText}` }]
+            });
+            if (/^PASS/i.test(verdict.trim())) {
+              resultText += `\n\n[Internal Ralph Verdict: ${verdict.trim()}]`;
+              break;
+            }
+            lastVerdict = verdict;
+          }
+          return `--- Result from [${task.name}] ---\n${resultText || '(subagent produced no text output)'}`;
+        } catch (err) {
+          return `--- Error in [${task.name}] ---\n${(err as Error).message}`;
+        }
+      }));
+      
+      return results.join('\n\n');
+    },
+  });
+
+  return { ...base, spawn_subagent, spawn_swarm };
 }
 
 // Imported here to avoid a separate import in the execute closure above

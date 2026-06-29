@@ -1,5 +1,6 @@
 import { readFile, writeFile, readdir, mkdir } from 'fs/promises';
 import { join } from 'path';
+import Fuse from 'fuse.js';
 
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
 
@@ -98,13 +99,19 @@ export class MemoryManager {
   }
 
   async search(query: string): Promise<MemoryEntry[]> {
-    const q = query.toLowerCase();
-    return this.entries.filter(
-      (e) =>
-        e.name.toLowerCase().includes(q) ||
-        e.description.toLowerCase().includes(q) ||
-        e.body.toLowerCase().includes(q),
-    );
+    if (!query.trim()) return this.entries;
+    
+    // Use Fuse for fuzzy matching / lightweight semantic indexing
+    const fuse = new Fuse(this.entries, {
+      keys: ['name', 'description', 'body'],
+      includeScore: true,
+      threshold: 0.4, // lower threshold means stricter match
+      ignoreLocation: true,
+    });
+    
+    const results = fuse.search(query);
+    // Return top 5 most relevant hits
+    return results.slice(0, 5).map(result => result.item);
   }
 
   getSummary(): string {

@@ -12,6 +12,8 @@ import { AgentLoader } from './agentLoader.js';
 import { loadProjectConfig } from '../config.js';
 import { MemoryManager } from './memory.js';
 import { NotepadManager } from './notepad.js';
+import { EventBus } from './eventBus.js';
+import { HookRunner } from './hooks.js';
 
 export class AgentOrchestrator {
   private sessions: Map<string, AgentSession> = new Map();
@@ -21,6 +23,8 @@ export class AgentOrchestrator {
   private agentLoader: AgentLoader;
   private memoryManager: MemoryManager;
   private notepadManager: NotepadManager;
+  private eventBus: EventBus;
+  private hookRunner?: HookRunner;
 
   constructor(workdir?: string) {
     const wd = workdir ?? process.cwd();
@@ -32,6 +36,12 @@ export class AgentOrchestrator {
     );
     this.memoryManager = new MemoryManager(wd);
     this.notepadManager = new NotepadManager(wd);
+    this.eventBus = new EventBus();
+  }
+
+  /** Access the shared EventBus (for external hook registration). */
+  getEventBus(): EventBus {
+    return this.eventBus;
   }
 
   /**
@@ -46,6 +56,13 @@ export class AgentOrchestrator {
     const systemPrompt = await this.buildSystemPrompt(options, skillsContext);
     const customAgents = await this.agentLoader.loadAll();
     const projectConfig = await loadProjectConfig(options.workdir);
+
+    // Wire up hooks from project config
+    if (projectConfig.hooks) {
+      if (this.hookRunner) this.hookRunner.unregister();
+      this.hookRunner = new HookRunner(this.eventBus, projectConfig.hooks);
+      this.hookRunner.register();
+    }
 
     const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
     const tokenUsage: TokenUsage = {
@@ -65,6 +82,17 @@ export class AgentOrchestrator {
     };
     this.sessions.set(sessionId, session);
 
+    // Emit session.start
+    await this.eventBus.emit('session.start', {
+      event: 'session.start',
+      sessionId,
+      workdir: options.workdir,
+      timestamp: new Date().toISOString(),
+      prompt,
+    });
+
+    let sessionError = false;
+
     for await (const event of runAgentLoop({
       prompt,
       systemPrompt,
@@ -80,11 +108,21 @@ export class AgentOrchestrator {
       budget: options.budget,
       memoryManager: this.memoryManager,
       notepadManager: this.notepadManager,
+      eventBus: this.eventBus,
     })) {
       if (event.type === 'token_usage') {
         session.tokenUsage = event.data as TokenUsage;
       } else if (event.type === 'todo_update') {
         session.todos = event.data as AgentSession['todos'];
+      } else if (event.type === 'error') {
+        sessionError = true;
+        await this.eventBus.emit('session.error', {
+          event: 'session.error',
+          sessionId,
+          workdir: options.workdir,
+          timestamp: new Date().toISOString(),
+          error: String((event.data as { message: string }).message),
+        });
       } else if (event.type === 'done') {
         // Persist message history so the session can be resumed
         const done = event.data as { messages?: unknown[] };
@@ -94,6 +132,16 @@ export class AgentOrchestrator {
       }
 
       yield event;
+    }
+
+    // Emit session.end (unless already errored — error hook already fired above)
+    if (!sessionError) {
+      await this.eventBus.emit('session.end', {
+        event: 'session.end',
+        sessionId,
+        workdir: options.workdir,
+        timestamp: new Date().toISOString(),
+      });
     }
   }
 
@@ -114,6 +162,23 @@ export class AgentOrchestrator {
     const customAgents = await this.agentLoader.loadAll();
     const projectConfig = await loadProjectConfig(options.workdir);
 
+    // Wire up hooks if not already registered
+    if (projectConfig.hooks) {
+      if (this.hookRunner) this.hookRunner.unregister();
+      this.hookRunner = new HookRunner(this.eventBus, projectConfig.hooks);
+      this.hookRunner.register();
+    }
+
+    await this.eventBus.emit('session.start', {
+      event: 'session.start',
+      sessionId,
+      workdir: options.workdir,
+      timestamp: new Date().toISOString(),
+      prompt: newPrompt,
+    });
+
+    let sessionError = false;
+
     for await (const event of runAgentLoop({
       prompt: newPrompt,
       systemPrompt,
@@ -130,14 +195,33 @@ export class AgentOrchestrator {
       budget: options.budget,
       memoryManager: this.memoryManager,
       notepadManager: this.notepadManager,
+      eventBus: this.eventBus,
     })) {
-      if (event.type === 'done') {
+      if (event.type === 'error') {
+        sessionError = true;
+        await this.eventBus.emit('session.error', {
+          event: 'session.error',
+          sessionId,
+          workdir: options.workdir,
+          timestamp: new Date().toISOString(),
+          error: String((event.data as { message: string }).message),
+        });
+      } else if (event.type === 'done') {
         const done = event.data as { messages?: unknown[] };
         if (done.messages) {
           this.sessionMessages.set(sessionId, done.messages);
         }
       }
       yield event;
+    }
+
+    if (!sessionError) {
+      await this.eventBus.emit('session.end', {
+        event: 'session.end',
+        sessionId,
+        workdir: options.workdir,
+        timestamp: new Date().toISOString(),
+      });
     }
   }
 
@@ -194,6 +278,7 @@ export class AgentOrchestrator {
       '3. Run tests and verify changes before declaring success.',
       '4. Be concise in explanations but thorough in your work.',
       '5. When spawning subagents for specialized tasks, explain what they will do.',
+      '6. Use spawn_swarm for parallel tasks. When the swarm returns, act as the Reviewer: aggregate their outputs, resolve conflicts, and apply resulting changes cleanly.',
     );
 
     if (skillsContext) {

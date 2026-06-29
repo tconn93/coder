@@ -533,6 +533,7 @@
 
 <!-- Main area -->
 <div id="main">
+  <div id="swarm-canvas" style="padding: 10px; gap: 10px; flex-wrap: wrap; background: var(--bg2); border-bottom: 1px solid var(--border); display: none;"></div>
   <div id="messages">
     <div id="welcome">
       <span style="font-size:48px">🤖</span>
@@ -645,6 +646,8 @@ function cancelSession() {
     currentEventSource = null;
   }
   setStatus(false, 'Cancelled');
+  document.getElementById('swarm-canvas').style.display = 'none';
+  document.getElementById('swarm-canvas').innerHTML = '';
   if (currentAgentMessage) {
     if (currentAgentTextEl) {
       currentAgentTextEl.classList.remove('streaming-cursor');
@@ -665,6 +668,11 @@ async function sendMessage() {
   // Hide welcome screen
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
+
+  // Reset Swarm Canvas
+  const swarmCanvas = document.getElementById('swarm-canvas');
+  swarmCanvas.innerHTML = '';
+  swarmCanvas.style.display = 'none';
 
   // Add user message
   addMessage('user', prompt);
@@ -745,12 +753,17 @@ function handleEvent(event) {
 
     case 'subagent':
       setStatus(true, `Subagent ${event.data.name}: ${event.data.status}`);
+      updateSwarmCanvas(event.data);
       break;
 
     case 'done':
       finalizeAgentMessage();
       if (currentEventSource) currentEventSource.close();
       setStatus(false, 'Done');
+      setTimeout(() => {
+        const c = document.getElementById('swarm-canvas');
+        if(c.children.length === 0) c.style.display = 'none';
+      }, 5000);
       if (event.data.tokenUsage) updateTokenUsage(event.data.tokenUsage);
       break;
 
@@ -796,6 +809,40 @@ function renderAgentText() {
       scrollToBottom();
     }
   }, 30);
+}
+
+function updateSwarmCanvas(data) {
+  const canvas = document.getElementById('swarm-canvas');
+  if (canvas.style.display === 'none') {
+    canvas.style.display = 'flex';
+  }
+  
+  let node = document.getElementById('swarm-node-' + data.name);
+  if (!node) {
+    node = document.createElement('div');
+    node.id = 'swarm-node-' + data.name;
+    node.style.padding = '8px 12px';
+    node.style.border = '1px solid var(--accent)';
+    node.style.borderRadius = '6px';
+    node.style.background = 'var(--bg3)';
+    node.style.fontSize = '12px';
+    node.style.display = 'flex';
+    node.style.alignItems = 'center';
+    node.style.gap = '6px';
+    canvas.appendChild(node);
+  }
+
+  let icon = '🔄';
+  const statusLower = data.status.toLowerCase();
+  if (statusLower.includes('done') || statusLower.includes('success') || statusLower.includes('finished')) {
+    icon = '✅';
+    node.style.borderColor = 'var(--green)';
+  } else if (statusLower.includes('fail') || statusLower.includes('error')) {
+    icon = '❌';
+    node.style.borderColor = 'var(--red)';
+  }
+
+  node.innerHTML = `<span>${icon}</span> <strong>${data.name}</strong>: ${data.status}`;
 }
 
 function finalizeAgentMessage() {

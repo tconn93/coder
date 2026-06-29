@@ -1,0 +1,53 @@
+# Coder Agent — local development Docker Compose
+#
+# Start:  docker compose up -d
+# Logs:   docker compose logs -f
+# Stop:   docker compose down
+#
+# The agent's workspace is mounted from ./workspace (auto-created on the host).
+# The agent API is available at http://localhost:3000
+
+version: "3.8"
+
+services:
+  agent:
+    build: .
+    container_name: coder-agent
+    ports:
+      - "3000:3000"
+      - "9001:9001"
+    volumes:
+      # Mount a local workspace directory for sandboxed file access
+      - ./workspace:/workspace:rw
+    environment:
+      # Required: API key for orchestrator access
+      CODER_API_KEY: ${CODER_API_KEY:-change-me}
+      # Provider keys (set in .env or pass via shell)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # Default provider
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-anthropic}
+      # Agent config
+      CODER_MAX_TURNS: ${CODER_MAX_TURNS:-50}
+      CODER_BUDGET: ${CODER_BUDGET:-10.00}
+      CODER_PERMISSION_MODE: ${CODER_PERMISSION_MODE:-acceptEdits}
+      # Orchestrator connection (for cloud-agent integration)
+      AGENT_API_PORT: ${AGENT_API_PORT:-9001}
+      AGENT_ID: ${AGENT_ID:-}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+      MAIN_WS_URL: ${MAIN_WS_URL:-}
+      SESSION_ID: ${SESSION_ID:-}
+      DEPLOYMENT_ID: ${DEPLOYMENT_ID:-}
+      CLONE_URL: ${CLONE_URL:-}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      TASK: ${TASK:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

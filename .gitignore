@@ -6,4 +6,5 @@ dist/
 .omc/
 .coder/
 .claude/
-bin/
+bin/workspace/
+workspace/

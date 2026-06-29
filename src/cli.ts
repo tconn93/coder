@@ -310,6 +310,7 @@ program
   .version(VERSION)
   .argument('[prompt]', 'Prompt to run (if omitted, starts interactive REPL)')
   .option('--web', 'Start web UI server')
+  .option('--server', 'Start in headless API-only server mode (for Docker/cloud)')
   .option('--port <number>', 'Web server port', '3000')
   .option('--provider <name>', 'LLM provider: anthropic|openai|google|xai')
   .option('--model <model>', 'Model name (default: provider default)')
@@ -353,26 +354,31 @@ program
       verbose,
     };
 
-    // Handle --web flag
-    if (opts['web']) {
+    // Handle --web or --server flag
+    if (opts['web'] || opts['server']) {
       const { startWebServer } = await import('./server/index.js');
-      console.log(chalk.cyan(`\nStarting web server on port ${port}...`));
+      const mode = opts['server'] ? 'server' : 'web';
+      console.log(chalk.cyan(`\nStarting ${mode === 'server' ? 'headless API server' : 'web server'} on port ${port}...`));
+
+      // Start server (uses CODER_API_KEY from env if set)
       await startWebServer({ port, workdir });
 
-      // Try to open browser
-      try {
-        const { execSync } = await import('child_process');
-        const url = `http://localhost:${port}`;
-        const platform = process.platform;
-        if (platform === 'darwin') {
-          execSync(`open ${url}`);
-        } else if (platform === 'win32') {
-          execSync(`start ${url}`);
-        } else {
-          execSync(`xdg-open ${url}`);
+      // Open browser only in --web mode (not --server)
+      if (mode === 'web') {
+        try {
+          const { execSync } = await import('child_process');
+          const url = `http://localhost:${port}`;
+          const platform = process.platform;
+          if (platform === 'darwin') {
+            execSync(`open ${url}`);
+          } else if (platform === 'win32') {
+            execSync(`start ${url}`);
+          } else {
+            execSync(`xdg-open ${url}`);
+          }
+        } catch {
+          // Browser open failed, that's ok
         }
-      } catch {
-        // Browser open failed, that's ok
       }
 
       // Keep process alive
@@ -637,6 +643,54 @@ program
 
     console.log(chalk.cyan('Setup complete! Run `coder` to start.\n'));
     rl.close();
+  });
+
+// ---------------------------------------------------------------------------
+// gateway subcommand
+// ---------------------------------------------------------------------------
+program
+  .command('gateway')
+  .description('Launch a headless chat gateway (Discord/Telegram)')
+  .option('--type <type>', 'Gateway type (discord)', 'discord')
+  .option('--token <token>', 'Bot token (or set DISCORD_TOKEN/TELEGRAM_TOKEN env)')
+  .action(async (opts: Record<string, string>) => {
+    const type = opts['type'];
+    const token = opts['token'] || process.env[`${type.toUpperCase()}_TOKEN`];
+
+    if (!token) {
+      console.error(chalk.red(`\nError: Missing token. Use --token or set ${type.toUpperCase()}_TOKEN.\n`));
+      process.exit(1);
+    }
+
+    // Initialize core orchestrated services
+    const { AgentOrchestrator } = await import('./agent/index.js');
+    const { getDefaultProviderSetting, getDefaultModelSetting } = await import('./auth.js');
+    const { getDefaultModel } = await import('./providers/index.js');
+
+    const workdir = process.cwd();
+    const orchestrator = new AgentOrchestrator(workdir);
+
+    const provider = getDefaultProviderSetting() || process.env['DEFAULT_PROVIDER'] || 'anthropic';
+    const model = getDefaultModelSetting() || process.env['DEFAULT_MODEL'] || getDefaultModel(provider);
+
+    const agentOptions = {
+      provider,
+      model,
+      maxTurns: 50,
+      budget: 10.0,
+      verbose: false,
+      permissionMode: 'acceptEdits' as const,
+      workdir,
+    };
+
+    if (type === 'discord') {
+      const { DiscordGateway } = await import('./gateway/discord.js');
+      const gateway = new DiscordGateway(token, orchestrator, agentOptions);
+      await gateway.start();
+    } else {
+      console.error(chalk.red(`\nError: Unsupported gateway type '${type}'\n`));
+      process.exit(1);
+    }
   });
 
 program.parseAsync(process.argv).catch((err) => {

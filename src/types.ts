@@ -148,6 +148,75 @@ export interface CustomAgentDef {
   systemPrompt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Hook / Event Bus types (modeled on Claude Code's hook system)
+// ---------------------------------------------------------------------------
+
+/** Event names that fire throughout the agent lifecycle. */
+export type HookEventName =
+  | 'session.start'
+  | 'session.end'
+  | 'session.error'
+  | 'tool.before'
+  | 'tool.after'
+  | 'tool.error'
+  | 'agent.prompt'
+  | 'agent.response'
+  | 'agent.turn'
+  | 'notification.send';
+
+/** Context payload passed to hook commands via stdin (JSON). */
+export interface HookContext {
+  event: HookEventName;
+  sessionId: string;
+  workdir: string;
+  timestamp: string;
+  /** Tool name (for tool.* events) */
+  toolName?: string;
+  /** Tool input arguments (for tool.before) */
+  toolInput?: Record<string, unknown>;
+  /** Tool output or error (for tool.after / tool.error) */
+  toolOutput?: string;
+  /** The user prompt (for agent.prompt) */
+  prompt?: string;
+  /** The agent response text (for agent.response) */
+  response?: string;
+  /** Current turn number (for agent.turn) */
+  turn?: number;
+  /** Notification message (for notification.send) */
+  message?: string;
+  /** Error details (for session.error / tool.error) */
+  error?: string;
+}
+
+/** A single hook definition as configured in .coder/settings.json. */
+export interface HookConfig {
+  /** Regex or glob pattern matching tool names / event subtypes */
+  matcher?: string;
+  /** Shell command to execute when the hook fires */
+  command: string;
+  /** Max execution time in ms (default: 30000) */
+  timeout?: number;
+  /** Whether the agent should wait for this hook to complete (default: false) */
+  blocking?: boolean;
+}
+
+/** Top-level hooks configuration in .coder/settings.json. */
+export interface HooksConfig {
+  'session.start'?: HookConfig[];
+  'session.end'?: HookConfig[];
+  'session.error'?: HookConfig[];
+  'tool.before'?: HookConfig[];
+  'tool.after'?: HookConfig[];
+  'tool.error'?: HookConfig[];
+  'agent.prompt'?: HookConfig[];
+  'agent.response'?: HookConfig[];
+  'agent.turn'?: HookConfig[];
+  'notification.send'?: HookConfig[];
+}
+
+// ---------------------------------------------------------------------------
+
 export interface AgentLoopOptions {
   prompt: string;
   systemPrompt?: string;
@@ -171,4 +240,6 @@ export interface AgentLoopOptions {
   memoryManager?: import('./agent/memory.js').MemoryManager;
   /** Notepad manager instance for notepad tools */
   notepadManager?: import('./agent/notepad.js').NotepadManager;
+  /** EventBus for hook emissions throughout the agent lifecycle */
+  eventBus?: import('./agent/eventBus.js').EventBus;
 }

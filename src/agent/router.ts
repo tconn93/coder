@@ -122,9 +122,15 @@ export async function triageRequest(
 }
 
 export interface OrchestrationResult {
-  leanPrompt: string;
+  /** Context to inject into the existing system prompt (memory results, triage notes) */
+  triageContext: string;
+  /** Indices of previous messages to retain for context (empty = use all) */
+  selectedMessageIndices: number[];
+  /** Override provider (or empty = use default) */
   targetProvider: string;
+  /** Override model (or empty = use default) */
   targetModel: string;
+  /** Raw triage data for debugging / logging */
   triageData: TriageResponse;
 }
 
@@ -137,42 +143,50 @@ export async function routerMiddleware(
 ): Promise<OrchestrationResult> {
   // Map to a fast triage model based on their default provider to save cost
   let triageModel = defaultModel;
-  if (defaultProvider === 'openai') triageModel = 'gpt-4o-mini';
+  if (defaultProvider === 'openai') triageModel = 'gpt-5.4-nano';
   else if (defaultProvider === 'anthropic') triageModel = 'claude-haiku-4-5';
-  else if (defaultProvider === 'google' || defaultProvider === 'gcp') triageModel = 'gemini-1.5-flash';
+  else if (defaultProvider === 'google' || defaultProvider === 'gcp') triageModel = 'gemini-2.0-flash';
   else if (defaultProvider === 'xai') triageModel = 'grok-4-1-fast-non-reasoning';
+  else if (defaultProvider === 'deepseek') triageModel = 'deepseek-v4-flash';
 
   const triageData = await triageRequest(userInput, history, defaultProvider, triageModel);
 
   const indices = triageData.context_selection?.required_message_indices || [];
-  const selectedContext = assembleContext(history, indices);
 
   let memoryContext = '';
   if (triageData.memory_search?.perform_search) {
     memoryContext = await performMemorySearch(triageData.memory_search.search_queries || [], memoryManager);
   }
 
-  const leanPrompt = `System Prompt: You are a helpful AI assistant. Answer the user's request using the optimal context provided below.
-
-=== Relevant Conversation History ===
-${selectedContext || 'None'}
-
-=== Memory Search Results ===
-${memoryContext || 'None'}
-
-=== Latest User Request ===
-${userInput}
-`;
+  // Build triage context to inject into the system prompt (augments, not replaces)
+  const triageParts: string[] = [];
+  triageParts.push(`[Context Router] Intent: ${triageData.gist}`);
+  triageParts.push(`[Context Router] Difficulty: ${triageData.difficulty_level}/10, Deep thinking: ${triageData.requires_deep_thinking}`);
+  if (triageData.context_selection.strategy === 'relevant_only' && indices.length > 0) {
+    triageParts.push(`[Context Router] Context pruning: retained ${indices.length} relevant messages from history`);
+  }
+  if (memoryContext) {
+    triageParts.push('', '## Memory Search Results', memoryContext);
+  }
+  const triageContext = triageParts.join('\n');
 
   let targetProvider = defaultProvider;
   let targetModel = defaultModel;
 
   // Route to the strongest reasoning model on their chosen provider if difficulty > 7
-  if (triageData.difficulty_level > 7 || triageData.requires_deep_thinking) {
-    if (defaultProvider === 'openai') targetModel = 'o1';
+  // Route to the cost-effective fast model if difficulty <= 3
+  if (triageData.difficulty_level <= 3 && !triageData.requires_deep_thinking) {
+    if (defaultProvider === 'openai') targetModel = 'gpt-5.4-nano';
+    else if (defaultProvider === 'anthropic') targetModel = 'claude-haiku-4-5';
+    else if (defaultProvider === 'xai') targetModel = 'grok-4-1-fast-non-reasoning';
+    else if (defaultProvider === 'google' || defaultProvider === 'gcp') targetModel = 'gemini-2.0-flash';
+    else if (defaultProvider === 'deepseek') targetModel = 'deepseek-v4-flash';
+  } else if (triageData.difficulty_level > 7 || triageData.requires_deep_thinking) {
+    if (defaultProvider === 'openai') targetModel = 'gpt-5.4-pro';
     else if (defaultProvider === 'anthropic') targetModel = 'claude-opus-4-6';
     else if (defaultProvider === 'xai') targetModel = 'grok-4-1-fast-reasoning';
-    else if (defaultProvider === 'google' || defaultProvider === 'gcp') targetModel = 'gemini-2.0-pro';
+    else if (defaultProvider === 'google' || defaultProvider === 'gcp') targetModel = 'gemini-3.1-pro-preview';
+    else if (defaultProvider === 'deepseek') targetModel = 'deepseek-v4-pro';
   }
 
   console.log(`[System] Triage determined Difficulty=${triageData.difficulty_level}, Deep Thinking=${triageData.requires_deep_thinking}`);
@@ -180,9 +194,10 @@ ${userInput}
   console.log(`[System] Routing request to: ${targetProvider}:${targetModel}`);
 
   return {
-    leanPrompt,
+    triageContext,
+    selectedMessageIndices: indices,
     targetProvider,
     targetModel,
-    triageData
+    triageData,
   };
 }

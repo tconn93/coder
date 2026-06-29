@@ -1,0 +1,11 @@
+node_modules
+dist
+.coder
+.git
+*.md
+!skills/*.md
+.env
+.env.*
+.omc
+.claude
+*.log

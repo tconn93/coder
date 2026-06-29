@@ -1,13 +1,17 @@
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
+import type { HooksConfig } from './types.js';
 
 export interface ProjectConfig {
   /** When true, write all LLM request/response data to .coder/convos/<sessionId>.jsonl */
   debugPrompt: boolean;
+  /** Hook configurations (Claude Code-compatible hook system) */
+  hooks?: HooksConfig;
 }
 
 const DEFAULT_CONFIG: ProjectConfig = {
   debugPrompt: false,
+  hooks: {},
 };
 
 /**

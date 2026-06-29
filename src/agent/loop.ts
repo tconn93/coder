@@ -23,27 +23,80 @@ import { routerMiddleware } from './router.js';
 import type { StreamEvent, AgentLoopOptions, TokenUsage, TodoItem } from '../types.js';
 
 // ---------------------------------------------------------------------------
-// Cost estimation (per 1M tokens, input / output)
+// Cost estimation (per 1M tokens, input / output).
+// Sourced from provider pricing pages; snapshot identifiers (e.g. claude-sonnet-4-6
+// vs claude-sonnet-4-5) share the same tier pricing.
+// Uses prefix matching so claude-opus-4-5 and claude-opus-4-6 both match.
 // ---------------------------------------------------------------------------
 const PRICING: Record<string, [number, number]> = {
-  'claude-opus-4-6':   [15,    75],
-  'claude-sonnet-4-6': [3,     15],
-  'claude-haiku-4-5':  [0.25,  1.25],
-  'gpt-4o':            [2.5,   10],
-  'gpt-4o-mini':       [0.15,  0.6],
-  'o1':                [15,    60],
-  'o3-mini':           [1.1,   4.4],
-  'gemini-2.0-flash':  [0.075, 0.3],
-  'gemini-2.0-pro':    [1.25,  5],
-  'gemini-1.5-flash':  [0.075, 0.3],
-  'grok-4-1-fast-reasoning': [0.2, 0.5],
-  'grok-4-1-fast-non-reasoning': [0.2, 0.5],
-  'grok-4-20-reasoning': [0.5, 1.5],
-  'grok-4-20-non-reasoning': [0.5, 1.5],
+  // Anthropic
+  'claude-opus':    [15,    75],
+  'claude-sonnet':  [3,     15],
+  'claude-haiku':   [0.25,  1.25],
+  // OpenAI o-series
+  'o4-mini':        [1.1,   4.4],
+  'o3':             [10,    40],
+  'o3-mini':        [1.1,   4.4],
+  'o1':             [15,    60],
+  // OpenAI GPT-5.x
+  'gpt-5.4-pro':    [15,    150],
+  'gpt-5.4':        [2.5,   10],
+  'gpt-5.4-mini':   [0.5,   2],
+  'gpt-5.4-nano':   [0.1,   0.4],
+  'gpt-5.2-pro':    [15,    150],
+  'gpt-5.2':        [2.5,   10],
+  'gpt-5.1':        [2.5,   10],
+  'gpt-5':          [2.5,   10],
+  'gpt-5-mini':     [0.5,   2],
+  'gpt-5-nano':     [0.1,   0.4],
+  // OpenAI GPT-4
+  'gpt-4.1':        [2,     8],
+  'gpt-4.1-mini':   [0.4,   1.6],
+  'gpt-4.1-nano':   [0.1,   0.4],
+  'gpt-4o':         [2.5,   10],
+  'gpt-4o-mini':    [0.15,  0.6],
+  'gpt-3.5-turbo':  [0.5,   1.5],
+  // Google
+  'gemini-2.5-pro':       [1.25,  5],
+  'gemini-2.5-flash':     [0.075, 0.3],
+  'gemini-2.5-flash-lite': [0.075, 0.3],
+  'gemini-2.0-flash':     [0.075, 0.3],
+  'gemini-2.0-flash-lite': [0.075, 0.3],
+  'gemini-3':             [1.25,  5],
+  'gemini-3.1':           [1.25,  5],
+  'gemma-3-27b-it':       [0.075, 0.3],
+  'gemma-3-12b-it':       [0.075, 0.3],
+  'gemma-3-4b-it':        [0.075, 0.3],
+  'gemini-pro':           [1.25,  5],
+  'gemini-flash':         [0.075, 0.3],
+  // xAI
+  'grok-4-1-fast':    [0.2, 0.5],
+  'grok-4-fast':       [0.2, 0.5],
+  'grok-4.20':         [0.5, 1.5],
+  'grok-code-fast-1':  [0.2, 0.5],
+  'grok-3':            [0.5, 1.5],
+  'grok-3-mini':       [0.3, 1],
+  // DeepSeek (passed through to API — any model string works)
+  'deepseek-v4-pro':   [0.55, 2.19],
+  'deepseek-v4-flash': [0.27, 1.10],
+  'deepseek-chat':     [0.27, 1.10],
+  'deepseek-reasoner': [0.55, 2.19],
 };
 
 function estimateCost(model: string, input: number, output: number): number {
-  const [inRate, outRate] = PRICING[model] ?? [3, 15];
+  // Exact match first
+  if (PRICING[model]) {
+    const [inRate, outRate] = PRICING[model];
+    return (input * inRate + output * outRate) / 1_000_000;
+  }
+  // Prefix match (e.g., 'claude-opus-4-5' matches 'claude-opus')
+  for (const [prefix, [inRate, outRate]] of Object.entries(PRICING)) {
+    if (model.startsWith(prefix)) {
+      return (input * inRate + output * outRate) / 1_000_000;
+    }
+  }
+  // Fallback
+  const [inRate, outRate] = PRICING['claude-sonnet']!;
   return (input * inRate + output * outRate) / 1_000_000;
 }
 
@@ -91,7 +144,7 @@ export async function* runAgentLoop(
     pendingTodoEvents.push([...todos]);
   });
 
-  const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents, options.memoryManager, options.notepadManager);
+  const tools = createTools(options.workdir, todoTracker, options.provider, options.customAgents, options.memoryManager, options.notepadManager, undefined, options.permissionMode);
 
   // Build the raw conversation history (to save for full session transcript)
   const rawMessages: ModelMessage[] = [
@@ -101,22 +154,34 @@ export async function* runAgentLoop(
 
   // Pass history through the Intelligent Context Router to save tokens
   const previousMessagesArray = options.previousMessages as ModelMessage[] ?? [];
-  const { leanPrompt, targetProvider, targetModel, triageData } = await routerMiddleware(
-    options.prompt, 
+  const { triageContext, selectedMessageIndices, targetProvider, targetModel, triageData } = await routerMiddleware(
+    options.prompt,
     previousMessagesArray,
     options.provider,
     options.model,
     options.memoryManager
   );
 
-  // The actual mapped payload reducing context bloat for this request
+  // Filter previous messages to only triage-selected indices, then append the current prompt
+  const filteredHistory: ModelMessage[] = selectedMessageIndices.length > 0
+    ? selectedMessageIndices.map(i => previousMessagesArray[i]).filter(Boolean)
+    : previousMessagesArray;
   const routedMessages: ModelMessage[] = [
-    { role: 'user', content: leanPrompt }
+    ...filteredHistory,
+    { role: 'user', content: options.prompt },
   ];
+
+  // Inject triage context into the system prompt (augments, does not replace)
+  const augmentedSystemPrompt = triageContext
+    ? `${options.systemPrompt ?? ''}\n\n${triageContext}`
+    : options.systemPrompt;
 
   // Use the routed overriding provider/model, or fallback to user options
   const activeProvider = targetProvider || options.provider;
   const activeModel = targetModel || options.model;
+
+  // EventBus ref (may be undefined if no hooks configured)
+  const bus = options.eventBus;
 
   // Log the outgoing request
   await debugLog?.({
@@ -129,6 +194,17 @@ export async function* runAgentLoop(
     triageData,
   });
 
+  // Emit agent.prompt
+  await bus?.emit('agent.prompt', {
+    event: 'agent.prompt',
+    sessionId,
+    workdir: options.workdir,
+    timestamp: new Date().toISOString(),
+    prompt: options.prompt,
+  });
+
+  let turnCount = 0;
+
   function* flushTodos(): Generator<StreamEvent> {
     while (pendingTodoEvents.length > 0) {
       yield { type: 'todo_update', data: pendingTodoEvents.shift()! };
@@ -140,13 +216,14 @@ export async function* runAgentLoop(
 
     const result = streamText({
       model: getProvider(activeProvider, activeModel),
-      system: options.systemPrompt,
+      system: augmentedSystemPrompt,
       messages: routedMessages,
       tools,
       // Stop after maxTurns tool-use steps (default 50)
       stopWhen: stepCountIs(options.maxTurns ?? 50),
-      // Accumulate usage across all steps
+      // Accumulate usage across all steps and emit turn events
       onStepFinish: ({ usage }) => {
+        turnCount++;
         if (usage) {
           tokenUsage.inputTokens += usage.inputTokens ?? 0;
           tokenUsage.outputTokens += usage.outputTokens ?? 0;
@@ -157,6 +234,14 @@ export async function* runAgentLoop(
         if (tokenUsage.costUsd > budget) {
           budgetExceeded = true;
         }
+        // Fire-and-forget turn event (non-blocking to avoid slowing the loop)
+        bus?.emit('agent.turn', {
+          event: 'agent.turn',
+          sessionId,
+          workdir: options.workdir,
+          timestamp: new Date().toISOString(),
+          turn: turnCount,
+        });
       },
     });
 
@@ -181,6 +266,15 @@ export async function* runAgentLoop(
         case 'tool-call': {
           const toolPart = part as { type: 'tool-call'; toolName: string; input?: unknown };
           await debugLog?.({ type: 'tool_call', toolName: toolPart.toolName, input: toolPart.input });
+          // Emit tool.before
+          await bus?.emit('tool.before', {
+            event: 'tool.before',
+            sessionId,
+            workdir: options.workdir,
+            timestamp: new Date().toISOString(),
+            toolName: toolPart.toolName,
+            toolInput: toolPart.input as Record<string, unknown> | undefined,
+          });
           yield {
             type: 'tool_call',
             data: { name: toolPart.toolName, input: toolPart.input },
@@ -199,6 +293,26 @@ export async function* runAgentLoop(
           const resultPart = part as { type: 'tool-result'; toolName: string; output?: unknown };
           const outputStr = String(resultPart.output ?? '');
           await debugLog?.({ type: 'tool_result', toolName: resultPart.toolName, output: outputStr });
+          // Emit tool.after or tool.error based on output
+          if (outputStr.startsWith('Error:')) {
+            await bus?.emit('tool.error', {
+              event: 'tool.error',
+              sessionId,
+              workdir: options.workdir,
+              timestamp: new Date().toISOString(),
+              toolName: resultPart.toolName,
+              error: outputStr,
+            });
+          } else {
+            await bus?.emit('tool.after', {
+              event: 'tool.after',
+              sessionId,
+              workdir: options.workdir,
+              timestamp: new Date().toISOString(),
+              toolName: resultPart.toolName,
+              toolOutput: outputStr.slice(0, 2000),
+            });
+          }
           if (options.verbose) {
             yield {
               type: 'tool_result',
@@ -220,6 +334,13 @@ export async function* runAgentLoop(
         case 'error': {
           const errMsg = String((part as { error: unknown }).error);
           await debugLog?.({ type: 'error', message: errMsg });
+          await bus?.emit('tool.error', {
+            event: 'tool.error',
+            sessionId,
+            workdir: options.workdir,
+            timestamp: new Date().toISOString(),
+            error: errMsg,
+          });
           yield {
             type: 'error',
             data: { message: errMsg, code: 'STREAM_ERROR' },
@@ -228,7 +349,7 @@ export async function* runAgentLoop(
         }
 
         default:
-          // step-start, step-finish, finish, reasoning — no consumer action needed
+          // step-start, finish, reasoning — no consumer action needed
           break;
       }
     }
@@ -255,6 +376,15 @@ export async function* runAgentLoop(
     ];
 
     const finalText = await result.text;
+
+    // Emit agent.response
+    await bus?.emit('agent.response', {
+      event: 'agent.response',
+      sessionId,
+      workdir: options.workdir,
+      timestamp: new Date().toISOString(),
+      response: finalText.slice(0, 5000),
+    });
 
     // Log the complete response before emitting done
     await debugLog?.({
