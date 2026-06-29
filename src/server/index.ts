@@ -191,25 +191,23 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
       console.error('[server] Repo setup failed (non-fatal):', err);
     }
 
-    // Phase 2: submit the user's coding task
-    const { handleChat } = await import('./api.js');
-    const synthReq = {
-      body: {
-        prompt: process.env.TASK,
-        options: {
-          provider,
-          model: model || undefined,
-          workdir,
-        },
-      },
-    } as any;
-    const synthRes = {
-      status: () => synthRes,
-      json: (data: any) => {
-        console.log(`[server] Auto-start session created: ${data.sessionId}`);
-      },
-    } as any;
-    await handleChat(synthReq, synthRes);
+    // Phase 2: submit the user's coding task through the orchestrator session
+    // (uses startOrchestratorSession which bridges events to the Orch API via bridgeStreamEvent)
+    const { startOrchestratorSession } = await import('./api.js');
+    const { bridgeStreamEvent } = await import('./orchestrator-ws.js');
+    const sessionId = process.env.SESSION_ID || 'auto-start';
+    const options = {
+      provider,
+      model,
+      maxTurns: parseInt(process.env.CODER_MAX_TURNS || '50', 10),
+      budget: parseFloat(process.env.CODER_BUDGET || '10.00'),
+      permissionMode: 'acceptEdits' as const,
+      workdir,
+      verbose: false,
+    };
+    console.log(`[server] Starting orchestrator session for: ${process.env.TASK.slice(0, 100)}`);
+    await startOrchestratorSession(sessionId, process.env.TASK, options, bridgeStreamEvent);
+    console.log('[server] Auto-start task completed');
   }
 
   const authStatus = process.env.CODER_API_KEY ? '🔒 authenticated' : '⚠️  open (no CODER_API_KEY set)';

@@ -102,7 +102,7 @@ function emitOrchestratorEvent(type: string, payload: Record<string, unknown>): 
 // Persistent ID across a thought stream so deltas accumulate in the UI
 let currentThoughtId = '';
 
-function bridgeStreamEvent(event: StreamEvent): void {
+export function bridgeStreamEvent(event: StreamEvent): void {
   switch (event.type) {
     case 'text': {
       if (!currentThoughtId) currentThoughtId = `th-${Date.now()}`;
@@ -160,6 +160,24 @@ function bridgeStreamEvent(event: StreamEvent): void {
         lines: [`Subagent ${sa.name}: ${sa.status}`],
         source: 'system',
       });
+      break;
+    }
+
+    case 'status': {
+      const st = event.data as { state: string; summary?: string };
+      emitOrchestratorEvent('agent:status', {
+        state: st.state || 'idle',
+        uptimeSeconds: Math.floor(process.uptime()),
+        claudeActive: false,
+        queueDepth: 0,
+      });
+      if (st.summary) {
+        emitOrchestratorEvent('agent:log', {
+          stream: 'system',
+          lines: [st.summary],
+          source: 'system',
+        });
+      }
       break;
     }
 

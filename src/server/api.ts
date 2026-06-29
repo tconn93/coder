@@ -507,16 +507,29 @@ export async function interveneOrchestratorSession(
   try {
     for await (const event of s.orchestrator.resume(orchSessionId, message, options)) {
       broadcast(orchSessionId, event);
-      onEvent(event);
 
       if (event.type === 'token_usage') {
         s.tokenUsage = event.data as TokenUsage;
       }
 
-      if (event.type === 'done' || event.type === 'error') {
+      if (event.type === 'done') {
+        // Chat intervention completed — emit idle status instead of agent:done.
+        // The deployment stays RUNNING; only the overarching task completing ends it.
+        const done = event.data as { result: string; tokenUsage: unknown };
+        onEvent({ type: 'status', data: { state: 'idle', summary: done.result?.slice(0, 300) || 'Response complete' } } as any);
+        broadcast(orchSessionId, { type: 'status', data: { state: 'idle' } } as any);
         s.isRunning = false;
         break;
       }
+
+      if (event.type === 'error') {
+        onEvent(event);
+        s.isRunning = false;
+        break;
+      }
+
+      // Forward all other events (text, tool_call, etc.)
+      onEvent(event);
     }
   } catch (err) {
     const errEvent: StreamEvent = {
