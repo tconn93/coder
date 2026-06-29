@@ -107,6 +107,10 @@ export const SUPPORTED_PROVIDERS: Record<string, ProviderConfig> = {
   xai: {
     models: [
       // Grok 4.x
+      'grok-4.3',
+      'grok-4.20-reasoning',
+      'grok-4.20-non-reasoning',
+      'grok-4.20-multi-agent',
       'grok-4-1-fast-reasoning',
       'grok-4-1-fast-non-reasoning',
       'grok-4-fast-reasoning',
@@ -121,8 +125,10 @@ export const SUPPORTED_PROVIDERS: Record<string, ProviderConfig> = {
       'grok-4-latest',
       'grok-3-latest',
       'grok-3-mini-latest',
+      // Build agent
+      'grok-build-0.1',
     ],
-    defaultModel: 'grok-4-1-fast-reasoning',
+    defaultModel: 'grok-4.3',
   },
   deepseek: {
     models: [
@@ -176,6 +182,59 @@ export function getProvider(provider: string, model: string): LanguageModel {
         name: 'deepseek',
         apiKey,
         baseURL: 'https://api.deepseek.com/v1',
+      });
+      return client.languageModel(model)!;
+    }
+
+    // ── OpenAI-compatible providers ──
+
+    case 'groq': {
+      const apiKey = getApiKey('groq') ?? process.env.GROQ_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'groq'. Run `coder auth` to set one up.");
+      const client = createOpenAICompatible({
+        name: 'groq',
+        apiKey,
+        baseURL: 'https://api.groq.com/openai/v1',
+      });
+      return client.languageModel(model)!;
+    }
+
+    case 'openrouter': {
+      const apiKey = getApiKey('openrouter') ?? process.env.OPENROUTER_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'openrouter'. Run `coder auth` to set one up.");
+      const client = createOpenAICompatible({
+        name: 'openrouter',
+        apiKey,
+        baseURL: 'https://openrouter.ai/api/v1',
+      });
+      return client.languageModel(model)!;
+    }
+
+    case 'azure-openai': {
+      const apiKey = getApiKey('azure-openai') ?? process.env.AZURE_OPENAI_API_KEY;
+      if (!apiKey) throw new Error("No API key configured for 'azure-openai'. Run `coder auth` to set one up.");
+      // Azure requires a resource name; default to env var or placeholder
+      const resourceName = process.env.AZURE_RESOURCE_NAME || 'openai';
+      const client = createOpenAICompatible({
+        name: 'azure-openai',
+        apiKey,
+        baseURL: `https://${resourceName}.openai.azure.com/openai/v1`,
+      });
+      return client.languageModel(model)!;
+    }
+
+    case 'aws-bedrock': {
+      const accessKey = getApiKey('aws-bedrock') ?? process.env.AWS_ACCESS_KEY_ID;
+      const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+      if (!accessKey) throw new Error("No access key configured for 'aws-bedrock'. Run `coder auth` to set one up.");
+      // Bedrock uses AWS SigV4 — the openai-compatible bridge needs special headers.
+      // For now, pass access key and rely on the provider's HTTP gateway.
+      const region = process.env.AWS_REGION || 'us-east-1';
+      const client = createOpenAICompatible({
+        name: 'aws-bedrock',
+        apiKey: accessKey,
+        baseURL: `https://bedrock-runtime.${region}.amazonaws.com`,
+        headers: secretKey ? { 'x-amz-secret-access-key': secretKey } : undefined,
       });
       return client.languageModel(model)!;
     }

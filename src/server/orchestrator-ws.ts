@@ -200,7 +200,8 @@ function bridgeStreamEvent(event: StreamEvent): void {
 
 async function handleCommandStart(data: Record<string, unknown>): Promise<void> {
   const payload = (data.payload || data) as Record<string, unknown>;
-  const task = (payload.task?.description as string) || (payload.taskDescription as string) || (payload.prompt as string);
+  const taskObj = payload.task as Record<string, unknown> | undefined;
+  const task = (taskObj?.description as string) || (payload.taskDescription as string) || (payload.prompt as string);
 
   if (!task) {
     console.log('[orch-ws] command:start received without task — ignoring');

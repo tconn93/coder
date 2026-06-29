@@ -78,12 +78,16 @@ fi
 
 PROVIDER="${DEFAULT_PROVIDER:-anthropic}"
 case "$PROVIDER" in
-  anthropic) KEY_VAR="ANTHROPIC_API_KEY" ;;
-  openai)    KEY_VAR="OPENAI_API_KEY" ;;
-  google)    KEY_VAR="GOOGLE_GENERATIVE_AI_API_KEY" ;;
-  xai)       KEY_VAR="XAI_API_KEY" ;;
-  deepseek)  KEY_VAR="DEEPSEEK_API_KEY" ;;
-  *)         KEY_VAR="" ;;
+  anthropic)      KEY_VAR="ANTHROPIC_API_KEY" ;;
+  openai)         KEY_VAR="OPENAI_API_KEY" ;;
+  google)         KEY_VAR="GOOGLE_GENERATIVE_AI_API_KEY" ;;
+  xai)            KEY_VAR="XAI_API_KEY" ;;
+  deepseek)       KEY_VAR="DEEPSEEK_API_KEY" ;;
+  groq)           KEY_VAR="GROQ_API_KEY" ;;
+  openrouter)     KEY_VAR="OPENROUTER_API_KEY" ;;
+  azure-openai)   KEY_VAR="AZURE_OPENAI_API_KEY" ;;
+  aws-bedrock)    KEY_VAR="AWS_ACCESS_KEY_ID" ;;
+  *)              KEY_VAR="" ;;
 esac
 
 if [ -n "$KEY_VAR" ] && [ -z "${!KEY_VAR:-}" ]; then

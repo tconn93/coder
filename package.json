@@ -1,10 +1,10 @@
 {
-  "name": "coder",
+  "name": "coder-next",
   "version": "1.0.0",
   "description": "AI Coding Agent powered by Vercel AI SDK",
   "type": "module",
   "bin": {
-    "coder": "./dist/cli.js"
+    "coder-next": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",

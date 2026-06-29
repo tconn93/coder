@@ -32,9 +32,11 @@ WORKDIR /app
 # Install build deps
 RUN apk add --no-cache git
 
-# Copy package files and install
-COPY package.json package-lock.json tsconfig.json ./
-RUN npm ci
+# Copy package files and install.  Using `npm install` (not `npm ci`) because
+# this package lives in a monorepo where the authoritative lock file is at the
+# workspace root — a local package-lock.json may not exist.
+COPY package.json tsconfig.json ./
+RUN npm install --ignore-scripts
 
 # Copy source and build
 COPY src/ ./src/
@@ -68,17 +70,10 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV CODER_WORKDIR=/workspace
-# Require an API key for the orchestrator API (set via env or docker run -e)
+# Runtime config — provider API keys are injected by the node daemon at
+# container creation time (e.g. DEFAULT_PROVIDER, XAI_API_KEY).
+# The entrypoint validates the required key for DEFAULT_PROVIDER at startup.
 ENV CODER_API_KEY=
-# Provider API keys (set at runtime)
-ENV ANTHROPIC_API_KEY=
-ENV OPENAI_API_KEY=
-ENV GOOGLE_GENERATIVE_AI_API_KEY=
-ENV XAI_API_KEY=
-ENV DEEPSEEK_API_KEY=
-# Default provider/model
-ENV DEFAULT_PROVIDER=anthropic
-ENV DEFAULT_MODEL=
 
 # Expose both ports: 3000 (web UI) and 9001 (orchestrator API)
 EXPOSE 3000

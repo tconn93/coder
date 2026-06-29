@@ -161,19 +161,36 @@ export async function startWebServer(options: WebServerOptions): Promise<void> {
     console.log(`  Orchestrator API: http://0.0.0.0:${agentApiPort}/api/v1`);
   }
 
-  // Auto-start mode: if AUTO_START=1 and TASK is set, submit an initial chat
+  // Auto-start mode: if AUTO_START=1 and TASK is set, first discover the
+  // dev server command using the LLM, then submit the user's task.
   if (process.env.AUTO_START === '1' && process.env.TASK) {
-    console.log(`[server] Auto-starting agent task: ${process.env.TASK.slice(0, 100)}`);
-    // Import dynamically to avoid circular deps
+    const workdir = process.env.CODER_WORKDIR || '/workspace';
+    const provider = process.env.DEFAULT_PROVIDER || 'anthropic'; // 'anthropic' only as CLI fallback — node always sets DEFAULT_PROVIDER
+    const model = process.env.AGENT_MODEL || process.env.DEFAULT_MODEL || '';
+
+    console.log(`[server] Auto-starting agent for: ${process.env.TASK.slice(0, 100)}`);
+
+    // Phase 1: discover and start the dev server (LLM-driven)
+    try {
+      const { discoverDevCommand, startDevServer } = await import('../agent/repoSetup.js');
+      const discovered = await discoverDevCommand(workdir, provider, model);
+      console.log(`[server] Dev command (${discovered.source}): ${discovered.command}`);
+      startDevServer(workdir, discovered.command);
+      // Give the dev server a moment to start binding ports
+      await new Promise((r) => setTimeout(r, 3000));
+    } catch (err) {
+      console.error('[server] Repo setup failed (non-fatal):', err);
+    }
+
+    // Phase 2: submit the user's coding task
     const { handleChat } = await import('./api.js');
-    // Create a synthetic request to trigger the agent
     const synthReq = {
       body: {
         prompt: process.env.TASK,
         options: {
-          provider: process.env.DEFAULT_PROVIDER || 'anthropic',
-          model: process.env.AGENT_MODEL || process.env.DEFAULT_MODEL || '',
-          workdir: process.env.CODER_WORKDIR || '/workspace',
+          provider,
+          model: model || undefined,
+          workdir,
         },
       },
     } as any;
